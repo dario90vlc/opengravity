@@ -174,7 +174,10 @@ There is no telemetry.
 
 #### Editor
 
-- **Monaco** with its own dark theme and per-language highlighting
+- **Monaco** with its own dark theme and per-language highlighting, including
+  basic R syntax and the **Nord** theme preset
+- **Audio and PDF viewer** in the editor pane (up to 50 MB)
+- **Find in page** in the built-in browser with `Ctrl/Cmd+F`
 - **Composer attachments**: paste or drop images and files; they appear as
   removable chips and travel with the message.
 - **Remote SSH**: direct project mount through WinFsp + SSHFS-Win (Settings ›
@@ -212,9 +215,12 @@ command and arguments.
 
 - **Terminal** integrated with persistent `cd` (`Ctrl+\``)
 - **Git**: branch, modified files, stage, commit and per-file diff
+- Faster startup: window first, engine and session repair in the background,
+  lazy Monaco and non-blocking provider discovery
 - Summary panel with Files, Plugins, Review and Terminal
 - Turn navigator, per-response action bar, reactions
-- `/` commands and `@` mentions in the composer
+- `/` commands and `@` mentions in the composer, including `/btw` for a side
+  question that does not touch the thread
 - **Bilingual interface**: English and Spanish, with system-language detection
   and a selector in Settings › Application
 - Conversation search and persistent sessions in JSONL
@@ -227,6 +233,7 @@ command and arguments.
 | `Ctrl+N` | New conversation |
 | `Ctrl+M` | Model selector |
 | `Ctrl+\`` | Terminal |
+| `Ctrl+F` | Find in page (browser) |
 | `/` | Command palette |
 | `@` | Mention a file |
 | `Ctrl+S` | Save (editor) |
@@ -537,7 +544,10 @@ El portable no se autoactualiza: enlaza a la nueva release. Sin telemetría.
 
 #### Editor
 
-- **Monaco** con tema oscuro propio y resaltado por lenguaje
+- **Monaco** con tema oscuro propio y resaltado por lenguaje, con sintaxis
+  básica de R y el preset **Nord**
+- **Visor de audio y PDF** en el panel del editor (hasta 50 MB)
+- **Buscar en página** del navegador integrado con `Ctrl/Cmd+F`
 - **LSP**: completado, diagnósticos, ir a definición, renombrar, formatear
   (TypeScript/JavaScript incluido en el proyecto; python/go/rust configurables)
 - **Adjuntos en el composer**: pega o arrastra imágenes y ficheros; aparecen como
@@ -574,9 +584,12 @@ comando y los argumentos de cada servidor.
 
 - **Terminal** integrada con `cd` persistente (`Ctrl+\``)
 - **Git**: rama, ficheros modificados, stage, commit y diff por fichero
+- Arranque más rápido: ventana primero, motor y reparación de sesiones en
+  segundo plano, Monaco bajo demanda y proveedores sin bloquear
 - Panel de resumen con Files, Plugins, Review y Terminal
 - Navegador de turnos, barra de acciones por respuesta, reacciones
-- Comandos `/` y menciones `@` en el composer
+- Comandos `/` y menciones `@` en el composer, incluido `/btw` para una
+  pregunta lateral que no toca el hilo
 - **Interfaz bilingüe**: inglés y español, con detección del idioma del sistema y selector en Ajustes › Application
 - Búsqueda de conversaciones, sesiones persistentes en JSONL
 
@@ -588,6 +601,7 @@ comando y los argumentos de cada servidor.
 | `Ctrl+N` | Nueva conversación |
 | `Ctrl+M` | Selector de modelo |
 | `Ctrl+\`` | Terminal |
+| `Ctrl+F` | Buscar en página (navegador) |
 | `/` | Paleta de comandos |
 | `@` | Mencionar fichero |
 | `Ctrl+S` | Guardar (editor) |
