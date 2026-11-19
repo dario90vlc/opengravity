@@ -43,6 +43,7 @@
     theme: 'Dark',
     themeContrast: 'Default',
     darkPreset: 'Default Dark',
+    lightPreset: 'Default Light',
     notifications: true,
     sounds: false,
     volume: 100,
@@ -172,10 +173,71 @@
    * Un `<select>` nativo se pinta con el tema del sistema y salía blanco sobre
    * la interfaz oscura, así que no sirve.
    */
-  /** Cierra todos los desplegables abiertos. */
+  /** Cierra todos los desplegables y selectores de color abiertos. */
+  let tooltipEl = null;
+
+  function ensureTooltip() {
+    if (!tooltipEl) {
+      tooltipEl = el('div', 'ui-tooltip');
+      tooltipEl.setAttribute('role', 'tooltip');
+      tooltipEl.hidden = true;
+      document.body.append(tooltipEl);
+    }
+    return tooltipEl;
+  }
+
+  function hideTooltip() {
+    if (tooltipEl) tooltipEl.hidden = true;
+  }
+
+  function showTooltip(target) {
+    const label = target?.getAttribute('aria-label');
+    if (!label) return;
+    const tip = ensureTooltip();
+    tip.textContent = label;
+    tip.hidden = false;
+
+    const rect = target.getBoundingClientRect();
+    const tipRect = tip.getBoundingClientRect();
+    const margin = 8;
+    let top = rect.top - tipRect.height - 7;
+    if (top < margin) top = rect.bottom + 7;
+    let left = rect.left + (rect.width - tipRect.width) / 2;
+    left = Math.max(margin, Math.min(window.innerWidth - tipRect.width - margin, left));
+
+    tip.style.top = `${Math.round(top)}px`;
+    tip.style.left = `${Math.round(left)}px`;
+  }
+
+  function bindTooltip(target) {
+    target.addEventListener('mouseenter', () => showTooltip(target));
+    target.addEventListener('focusin', () => showTooltip(target));
+    target.addEventListener('mouseleave', hideTooltip);
+    target.addEventListener('focusout', hideTooltip);
+    target.addEventListener('click', hideTooltip);
+  }
+
+  function getScrollContainer() {
+    return els.body?.closest('.settings__content') ?? els.body;
+  }
+
   function cerrarDesplegables() {
-    for (const p of document.querySelectorAll('.dropdown__panel')) p.hidden = true;
+    hideTooltip();
+    for (const p of document.querySelectorAll('.dropdown__panel')) {
+      p.hidden = true;
+      p.classList.remove('is-dropup');
+      p.style.position = '';
+      p.style.top = '';
+      p.style.bottom = '';
+      p.style.left = '';
+      p.style.right = '';
+      p.style.maxHeight = '';
+    }
     for (const t of document.querySelectorAll('.dropdown__trigger')) t.setAttribute('aria-expanded', 'false');
+    for (const c of document.querySelectorAll('.color-popover')) {
+      c.hidden = true;
+      c.classList.remove('is-dropup');
+    }
   }
 
   /*
@@ -241,10 +303,24 @@
     return grid;
   }
 
-  function makeSelect({ options, value, onChange, wide }) {
+  function shouldFlipUp(anchorEl, estimatedHeight) {
+    const container = anchorEl.closest('.settings__content') || anchorEl.closest('.settings__body');
+    const anchorRect = anchorEl.getBoundingClientRect();
+    const bounds = container
+      ? container.getBoundingClientRect()
+      : { top: 0, bottom: window.innerHeight };
+    const spaceBelow = bounds.bottom - anchorRect.bottom;
+    const spaceAbove = anchorRect.top - bounds.top;
+    return spaceBelow < estimatedHeight && spaceAbove > spaceBelow;
+  }
+
+  function makeSelect({ options, value, onChange, wide, compact }) {
     const normalizadas = options.map((o) => (typeof o === 'string' ? { label: o } : o));
     const valorDe = (opcion) => opcion.value ?? opcion.label;
-    const wrap = el('div', wide ? 'dropdown dropdown--wide' : 'dropdown');
+    const classes = ['dropdown'];
+    if (wide) classes.push('dropdown--wide');
+    if (compact) classes.push('dropdown--compact');
+    const wrap = el('div', classes.join(' '));
 
     const trigger = el('button', 'dropdown__trigger');
     trigger.type = 'button';
@@ -293,6 +369,7 @@
           seleccionada = valorDe(opcion);
           pintar();
           panel.hidden = true;
+          panel.classList.remove('is-dropup');
           trigger.setAttribute('aria-expanded', 'false');
           onChange(seleccionada);
         });
@@ -306,13 +383,36 @@
     trigger.addEventListener('click', (event) => {
       event.stopPropagation();
       const abrir = panel.hidden;
-      // Cierra cualquier otro desplegable abierto: dos a la vez se solapan.
       cerrarDesplegables();
-      panel.hidden = !abrir;
+      if (abrir) {
+        panel.hidden = false;
+        if (compact) {
+          const rect = trigger.getBoundingClientRect();
+          const margin = 12;
+          const naturalHeight = panel.scrollHeight || 380;
+          const spaceBelow = window.innerHeight - rect.bottom - margin;
+          const spaceAbove = rect.top - margin;
+          const openUp = spaceBelow < naturalHeight && spaceAbove > spaceBelow;
+          panel.style.position = 'fixed';
+          panel.style.right = `${Math.max(margin, window.innerWidth - rect.right)}px`;
+          panel.style.left = 'auto';
+          if (openUp) {
+            panel.style.top = 'auto';
+            panel.style.bottom = `${window.innerHeight - rect.top + 4}px`;
+            panel.style.maxHeight = `${Math.max(160, Math.min(440, spaceAbove - 4))}px`;
+          } else {
+            panel.style.bottom = 'auto';
+            panel.style.top = `${rect.bottom + 4}px`;
+            panel.style.maxHeight = `${Math.max(160, Math.min(440, spaceBelow - 4))}px`;
+          }
+        } else {
+          const needed = Math.min(panel.scrollHeight || 260, 320) + 12;
+          panel.classList.toggle('is-dropup', shouldFlipUp(trigger, needed));
+        }
+      }
       trigger.setAttribute('aria-expanded', String(abrir));
     });
 
-    // El cierre al pulsar fuera y con Escape lo resuelve el listener global.
     wrap.addEventListener('click', (event) => event.stopPropagation());
 
     wrap.append(trigger, panel);
@@ -321,14 +421,29 @@
 
   function makeSegmented({ options, value, onChange }) {
     const wrap = el('div', 'segmented');
-    for (const option of options) {
-      const btn = el('button', 'segmented__btn', option);
+    for (const raw of options) {
+      const opt = typeof raw === 'string' ? { value: raw, label: raw } : raw;
+      const btn = el('button', opt.icon ? 'segmented__btn segmented__btn--icon' : 'segmented__btn');
       btn.type = 'button';
-      if (option === value) btn.classList.add('is-active');
+      if (opt.icon) {
+        btn.innerHTML = window.Icon(opt.icon, 16);
+        const tip = opt.title ?? opt.label ?? opt.value;
+        btn.setAttribute('aria-label', tip);
+        bindTooltip(btn);
+      } else {
+        btn.textContent = opt.label ?? opt.value;
+      }
+      const isSelected = opt.value === value;
+      if (isSelected) btn.classList.add('is-active');
+      btn.setAttribute('aria-pressed', String(isSelected));
       btn.addEventListener('click', () => {
-        for (const child of wrap.children) child.classList.remove('is-active');
+        for (const child of wrap.children) {
+          child.classList.remove('is-active');
+          child.setAttribute('aria-pressed', 'false');
+        }
         btn.classList.add('is-active');
-        onChange(option);
+        btn.setAttribute('aria-pressed', 'true');
+        onChange(opt.value);
       });
       wrap.append(btn);
     }
@@ -520,6 +635,37 @@
     // Avisa a la app para que aplique el cambio (contraste, sonido, cola…).
     if (bridge && typeof bridge.onPrefChange === 'function') {
       bridge.onPrefChange(key, value, prefs);
+    }
+    return guardado;
+  }
+
+  function setPrefsPatch(patch) {
+    const anteriores = {};
+    for (const [k, v] of Object.entries(patch)) {
+      anteriores[k] = prefs[k];
+      prefs[k] = v;
+    }
+    const keys = Object.keys(patch);
+    const firstKey = keys[0];
+    const guardado = window.api
+      .setPrefs(patch)
+      .then((respuesta) => {
+        if (respuesta && respuesta.ok === false) throw new Error(respuesta.error ?? 'no se pudo guardar');
+        return respuesta;
+      })
+      .catch((error) => {
+        for (const [k, v] of Object.entries(anteriores)) prefs[k] = v;
+        if (typeof bridge?.onPrefChange === 'function') {
+          bridge.onPrefChange(firstKey, prefs[firstKey], prefs);
+        }
+        bridge?.addNotice?.(
+          `No se pudo guardar «${firstKey}»: ${error?.message ?? error}`,
+          'error',
+        );
+        return null;
+      });
+    if (bridge && typeof bridge.onPrefChange === 'function') {
+      bridge.onPrefChange(firstKey, prefs[firstKey], prefs);
     }
     return guardado;
   }
@@ -785,87 +931,373 @@
     ];
   }
 
-  function renderAppearance() {
-    const colors = prefs.themeColors ?? {};
+  const codePreviewOpen = { light: false, dark: false };
 
-    /** Valor efectivo de un token, en hex, para el selector de color. */
-    const tokenHex = (variable, fallback) => {
-      const sondeo = document.createElement('span');
-      sondeo.style.color = getComputedStyle(document.documentElement).getPropertyValue(variable).trim();
-      document.body.append(sondeo);
-      const rgb = getComputedStyle(sondeo).color;
-      sondeo.remove();
-      const match = /^rgb\((\d+),?\s+(\d+),?\s+(\d+)\)$/.exec(rgb);
-      if (!match) return fallback;
-      return `#${[1, 2, 3].map((i) => Number(match[i]).toString(16).padStart(2, '0')).join('')}`;
+  function makeColorPill({ value, ariaLabel, onLiveChange, onCommit }) {
+    const engine = window.ThemeEngine;
+    let currentHex = engine.normalizeHex(value) ?? '#000000';
+    let hsv = engine.hexToHsv(currentHex);
+
+    const wrap = el('div', 'color-pill-wrap');
+    const pill = el('div', 'color-pill');
+
+    const swatchBtn = el('button', 'color-pill__swatch');
+    swatchBtn.type = 'button';
+    swatchBtn.setAttribute('aria-label', ariaLabel);
+
+    const hash = el('span', 'color-pill__hash', '#');
+
+    const hexInput = document.createElement('input');
+    hexInput.type = 'text';
+    hexInput.className = 'color-pill__hex';
+    hexInput.maxLength = 6;
+    hexInput.spellcheck = false;
+    hexInput.autocomplete = 'off';
+    hexInput.setAttribute('aria-label', `${ariaLabel} hex`);
+
+    pill.append(swatchBtn, hash, hexInput);
+
+    const popover = el('div', 'color-popover');
+    popover.hidden = true;
+
+    const svArea = el('div', 'color-popover__sv');
+    const svCursor = el('div', 'color-popover__sv-cursor');
+    svArea.append(svCursor);
+
+    const hueTrack = el('div', 'color-popover__hue');
+    const hueThumb = el('div', 'color-popover__hue-thumb');
+    hueTrack.append(hueThumb);
+
+    popover.append(svArea, hueTrack);
+    wrap.append(pill, popover);
+
+    const syncVisuals = (updateInput = true) => {
+      swatchBtn.style.backgroundColor = currentHex;
+      if (updateInput) hexInput.value = currentHex.slice(1);
+      const pureHue = engine.hsvToHex(hsv.h, 1, 1);
+      svArea.style.backgroundColor = pureHue;
+      svCursor.style.left = `${(hsv.s * 100).toFixed(2)}%`;
+      svCursor.style.top = `${((1 - hsv.v) * 100).toFixed(2)}%`;
+      svCursor.style.backgroundColor = currentHex;
+      hueThumb.style.left = `${((hsv.h / 360) * 100).toFixed(2)}%`;
+      hueThumb.style.backgroundColor = pureHue;
     };
 
-    const colorInput = (key, variable, fallback) => {
-      const input = document.createElement('input');
-      input.type = 'color';
-      input.className = 'color-input';
-      input.value = colors[key] ?? tokenHex(variable, fallback);
-      input.addEventListener('input', () => {
-        const next = { ...(prefs.themeColors ?? {}), [key]: input.value };
-        setPref('themeColors', next);
+    const emitLive = (nextHex) => {
+      currentHex = nextHex;
+      syncVisuals(true);
+      onLiveChange(currentHex);
+    };
+
+    const updateSvFromPointer = (event) => {
+      const rect = svArea.getBoundingClientRect();
+      if (!rect.width || !rect.height) return;
+      const s = Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width));
+      const v = 1 - Math.min(1, Math.max(0, (event.clientY - rect.top) / rect.height));
+      hsv = { ...hsv, s, v };
+      emitLive(engine.hsvToHex(hsv.h, hsv.s, hsv.v));
+    };
+
+    const updateHueFromPointer = (event) => {
+      const rect = hueTrack.getBoundingClientRect();
+      if (!rect.width) return;
+      const ratio = Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width));
+      hsv = { ...hsv, h: ratio >= 1 ? 359.99 : ratio * 360 };
+      emitLive(engine.hsvToHex(hsv.h, hsv.s, hsv.v));
+    };
+
+    const bindDrag = (target, onMove) => {
+      let dragging = false;
+      target.addEventListener('pointerdown', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        dragging = true;
+        target.setPointerCapture?.(event.pointerId);
+        onMove(event);
       });
-      return input;
+      target.addEventListener('pointermove', (event) => {
+        if (!dragging) return;
+        onMove(event);
+      });
+      const finish = (event) => {
+        if (!dragging) return;
+        dragging = false;
+        target.releasePointerCapture?.(event.pointerId);
+        onCommit(currentHex);
+      };
+      target.addEventListener('pointerup', finish);
+      target.addEventListener('pointercancel', finish);
     };
 
-    const resetBtn = makeButton({
-      label: 'Restablecer',
-      onClick: () => {
-        setPref('themeColors', {});
-        render();
-      },
+    bindDrag(svArea, updateSvFromPointer);
+    bindDrag(hueTrack, updateHueFromPointer);
+
+    const togglePopover = (event) => {
+      event.stopPropagation();
+      const willOpen = popover.hidden;
+      cerrarDesplegables();
+      if (willOpen) {
+        popover.hidden = false;
+        popover.classList.toggle('is-dropup', shouldFlipUp(pill, 232));
+      }
+    };
+
+    swatchBtn.addEventListener('click', togglePopover);
+
+    hexInput.addEventListener('input', () => {
+      const clean = hexInput.value.replace(/[^0-9a-fA-F]/g, '').toUpperCase().slice(0, 6);
+      if (hexInput.value !== clean) hexInput.value = clean;
+      if (clean.length === 6) {
+        const nextHex = `#${clean}`;
+        currentHex = nextHex;
+        hsv = engine.hexToHsv(nextHex);
+        syncVisuals(false);
+        onLiveChange(nextHex);
+      }
     });
 
-    return [
+    const commitHexInput = () => {
+      const normalized = engine.normalizeHex(hexInput.value);
+      if (normalized) {
+        currentHex = normalized;
+        hsv = engine.hexToHsv(normalized);
+        syncVisuals(true);
+        onCommit(currentHex);
+      } else {
+        syncVisuals(true);
+      }
+    };
+
+    hexInput.addEventListener('blur', commitHexInput);
+    hexInput.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        commitHexInput();
+        hexInput.blur();
+      } else if (event.key === 'Escape') {
+        syncVisuals(true);
+        hexInput.blur();
+      }
+    });
+
+    wrap.addEventListener('click', (event) => event.stopPropagation());
+
+    syncVisuals(true);
+
+    return {
+      el: wrap,
+      setColor(nextHex) {
+        const norm = engine.normalizeHex(nextHex);
+        if (!norm) return;
+        currentHex = norm;
+        hsv = engine.hexToHsv(norm);
+        syncVisuals(true);
+      },
+    };
+  }
+
+  function renderThemeSection(mode) {
+    const engine = window.ThemeEngine;
+    const isLight = mode === 'light';
+    const presetKey = isLight ? 'lightPreset' : 'darkPreset';
+    const colorsKey = isLight ? 'lightThemeColors' : 'themeColors';
+    const presets = engine.getPresetsForMode(mode);
+    const activePresetId = engine.getPreset(mode, prefs[presetKey]).id;
+    const effective = engine.getEffectiveColors(mode, prefs);
+
+    const resetBtn = el('button', 'preset-reset');
+    resetBtn.type = 'button';
+    resetBtn.innerHTML = window.Icon('resetUndo', 15);
+    resetBtn.setAttribute('aria-label', 'Reset to preset');
+    resetBtn.hidden = !engine.isPresetModified(mode, prefs);
+    bindTooltip(resetBtn);
+
+    const previewRow = el('div', 'code-preview');
+    const previewToggle = el('button', 'code-preview__toggle');
+    previewToggle.type = 'button';
+    previewToggle.setAttribute('aria-expanded', String(codePreviewOpen[mode]));
+    const previewLabel = el('span', 'code-preview__label', 'Code Preview');
+    const previewChevron = el('span', 'code-preview__chevron');
+    previewChevron.innerHTML = window.Icon('chevron', 14);
+    previewToggle.append(previewLabel, previewChevron);
+
+    const previewBody = el('pre', 'code-preview__body');
+    const previewCode = document.createElement('code');
+    const tok = (cls, text) => el('span', cls, text);
+    previewCode.append(
+      tok('tok-comment', '// Greet a user by name'),
+      '\n',
+      tok('tok-keyword', 'const'),
+      ' ',
+      tok('tok-function', 'greet'),
+      ' ',
+      tok('tok-operator', '='),
+      ' (name: ',
+      tok('tok-function', 'string'),
+      ') => {\n  ',
+      tok('tok-keyword', 'return'),
+      ' ',
+      tok('tok-string', '`Hello, ${name}!`'),
+      ';\n};',
+    );
+    previewBody.append(previewCode);
+    previewBody.hidden = !codePreviewOpen[mode];
+    previewRow.append(previewToggle, previewBody);
+
+    const syncPreviewTheme = () => {
+      const modePrefs = { ...prefs, theme: isLight ? 'Light' : 'Dark' };
+      const tokens = engine.buildThemeTokens(modePrefs, !isLight);
+      const activeMode = document.documentElement.dataset.theme === 'light' ? 'light' : 'dark';
+      const sameMode = mode === activeMode;
+      previewBody.classList.toggle('code-preview__body--isolated', !sameMode);
+      previewBody.style.backgroundColor = sameMode ? '' : tokens.colors.background;
+      previewBody.style.color = tokens.syntax.defaultFg;
+      for (const [varName, varVal] of Object.entries(tokens.cssVars)) {
+        if (varName.startsWith('--syntax-')) {
+          previewBody.style.setProperty(varName, varVal);
+        }
+      }
+    };
+
+    previewToggle.addEventListener('click', () => {
+      codePreviewOpen[mode] = !codePreviewOpen[mode];
+      previewToggle.setAttribute('aria-expanded', String(codePreviewOpen[mode]));
+      previewBody.hidden = !codePreviewOpen[mode];
+    });
+
+    const buildNextColors = (colorField, hex) => {
+      const preset = engine.getPreset(mode, prefs[presetKey]);
+      const next = { ...(prefs[colorsKey] ?? {}) };
+      if (hex === preset[colorField]) delete next[colorField];
+      else next[colorField] = hex;
+      return next;
+    };
+
+    const applyLiveColor = (colorField, hex) => {
+      const next = buildNextColors(colorField, hex);
+      prefs[colorsKey] = next;
+      resetBtn.hidden = !engine.isPresetModified(mode, prefs);
+      syncPreviewTheme();
+      if (bridge && typeof bridge.onPrefChange === 'function') {
+        bridge.onPrefChange(colorsKey, next, prefs);
+      }
+    };
+
+    const commitColor = (colorField, hex) => {
+      const next = buildNextColors(colorField, hex);
+      resetBtn.hidden = !engine.isPresetModified(mode, { ...prefs, [colorsKey]: next });
+      setPrefsPatch({ [colorsKey]: next });
+      syncPreviewTheme();
+    };
+
+    const bgControl = makeColorPill({
+      value: effective.background,
+      ariaLabel: 'Background',
+      onLiveChange: (hex) => applyLiveColor('background', hex),
+      onCommit: (hex) => commitColor('background', hex),
+    });
+    const fgControl = makeColorPill({
+      value: effective.foreground,
+      ariaLabel: 'Foreground',
+      onLiveChange: (hex) => applyLiveColor('foreground', hex),
+      onCommit: (hex) => commitColor('foreground', hex),
+    });
+    const accentControl = makeColorPill({
+      value: effective.accent,
+      ariaLabel: 'Accent',
+      onLiveChange: (hex) => applyLiveColor('accent', hex),
+      onCommit: (hex) => commitColor('accent', hex),
+    });
+
+    const syncControlsToPreset = (presetId) => {
+      const preset = engine.getPreset(mode, presetId);
+      bgControl.setColor(preset.background);
+      fgControl.setColor(preset.foreground);
+      accentControl.setColor(preset.accent);
+      resetBtn.hidden = true;
+      syncPreviewTheme();
+    };
+
+    resetBtn.addEventListener('click', () => {
+      cerrarDesplegables();
+      const currentPreset = engine.getPreset(mode, prefs[presetKey]).id;
+      setPrefsPatch({ [colorsKey]: {} });
+      syncControlsToPreset(currentPreset);
+    });
+
+    const presetSelect = makeSelect({
+      options: presets.map((p) => ({ value: p.id, label: p.label })),
+      value: activePresetId,
+      onChange: (value) => {
+        setPrefsPatch({ [presetKey]: value, [colorsKey]: {} });
+        syncControlsToPreset(value);
+      },
+      compact: true,
+    });
+
+    const presetControl = el('div', 'preset-control');
+    presetControl.append(resetBtn, presetSelect);
+
+    syncPreviewTheme();
+
+    return makeSection({
+      title: isLight ? 'Light Theme' : 'Dark Theme',
+      rows: [
+        makeRow({ label: 'Preset', control: presetControl }),
+        makeRow({ label: 'Background', control: bgControl.el }),
+        makeRow({ label: 'Foreground', control: fgControl.el }),
+        makeRow({ label: 'Accent', control: accentControl.el }),
+        previewRow,
+      ],
+    });
+  }
+
+  function renderAppearance() {
+    const currentTheme = prefs.theme ?? 'Dark';
+    const sections = [
       makeSection({
         title: 'Appearance',
-        desc: 'Contraste de la interfaz. Se aplica al instante.',
         rows: [
-          makeRow({
-            label: 'Tema',
-            desc: 'Oscuro o claro. Se aplica al instante.',
-            control: makeSegmented({
-              options: ['Dark', 'Light'],
-              value: prefs.theme ?? 'Dark',
-              onChange: (value) => { setPref('theme', value); render(); },
-            }),
-          }),
           makeRow({
             label: 'Theme',
-            desc: 'Contraste de la interfaz.',
+            control: makeSegmented({
+              options: [
+                { value: 'System', icon: 'monitor', title: 'System' },
+                { value: 'Light', icon: 'sun', title: 'Light' },
+                { value: 'Dark', icon: 'moon', title: 'Dark' },
+              ],
+              value: currentTheme,
+              onChange: (value) => {
+                setPref('theme', value);
+                render();
+              },
+            }),
+          }),
+          makeRow({
+            label: 'Contrast',
             control: makeSegmented({
               options: ['Default', 'Strong'],
-              value: prefs.themeContrast,
-              onChange: (value) => { setPref('themeContrast', value); render(); },
+              value: prefs.themeContrast ?? 'Default',
+              onChange: (value) => {
+                setPref('themeContrast', value);
+                render();
+              },
             }),
           }),
-        ],
-      }),
-      makeSection({
-        title: 'Dark Theme',
-        desc: 'Colores del tema oscuro. Se aplican en vivo y se guardan.',
-        rows: [
-          makeRow({
-            label: 'Preset',
-            desc: 'Combinación predefinida.',
-            control: makeSelect({
-              options: ['Default Dark', 'Nord'],
-              value: prefs.darkPreset,
-              onChange: (value) => { setPref('darkPreset', value); render(); },
-              wide: true,
-            }),
-          }),
-          makeRow({ label: 'Background', desc: 'Fondo del lienzo.', control: colorInput('background', '--background', '#101010') }),
-          makeRow({ label: 'Foreground', desc: 'Color del texto.', control: colorInput('foreground', '--foreground', '#cccccc') }),
-          makeRow({ label: 'Accent', desc: 'Color de acento y foco.', control: colorInput('accent', '--primary', '#007acc') }),
-          makeRow({ label: 'Restablecer colores', desc: 'Vuelve a la paleta por defecto.', control: resetBtn }),
         ],
       }),
     ];
+
+    if (currentTheme === 'System') {
+      sections.push(renderThemeSection('light'));
+      sections.push(renderThemeSection('dark'));
+    } else if (currentTheme === 'Light') {
+      sections.push(renderThemeSection('light'));
+    } else {
+      sections.push(renderThemeSection('dark'));
+    }
+
+    return sections;
   }
 
   function renderNotifications() {
@@ -2326,6 +2758,7 @@
   // -------------------------------------------------------------------------
 
   function render() {
+    hideTooltip();
     const meta = SECTIONS[active] ?? SECTIONS.general;
     if (active === 'project') {
       const cwd = proyectoActivo || bridge?.getState?.()?.cwd || '';
@@ -2366,7 +2799,8 @@
   function selectSection(section) {
     active = section;
     render();
-    els.body.scrollTop = 0;
+    const scroller = getScrollContainer();
+    if (scroller) scroller.scrollTop = 0;
   }
 
   /** Pinta las entradas de proyecto; Antigravity muestra tres y «Show All». */
@@ -2464,14 +2898,23 @@
     render();
     // Al abrir, la sección empieza arriba; el scroll de la vez anterior dejaba
     // el contenido cortado bajo la cabecera.
-    els.body.scrollTop = 0;
+    const scroller = getScrollContainer();
+    if (scroller) scroller.scrollTop = 0;
 
     // Foco dentro del diálogo: con Tab no se recorre la interfaz tapada.
     const primero = els.modal.querySelector('.settings__nav-item.is-active, button, [href], input');
     if (primero && typeof primero.focus === 'function') primero.focus();
   }
 
+  let scrollIdleTimer = null;
+
   function close() {
+    cerrarDesplegables();
+    if (scrollIdleTimer) {
+      clearTimeout(scrollIdleTimer);
+      scrollIdleTimer = null;
+    }
+    getScrollContainer()?.classList.remove('is-scrolling', 'is-scrollbar-hot');
     /*
      * Un campo con el foco (la clave recién pegada) se confirma al cerrar:
      * ocultar el modal sin blur perdía lo escrito.
@@ -2506,6 +2949,30 @@
     });
 
     els.feedback.addEventListener('click', () => selectSection('feedback'));
+    const scroller = getScrollContainer();
+    if (scroller) {
+      scroller.addEventListener(
+        'scroll',
+        () => {
+          cerrarDesplegables();
+          scroller.classList.add('is-scrolling');
+          if (scrollIdleTimer) clearTimeout(scrollIdleTimer);
+          scrollIdleTimer = setTimeout(() => {
+            scroller.classList.remove('is-scrolling');
+            scrollIdleTimer = null;
+          }, 900);
+        },
+        { passive: true },
+      );
+      scroller.addEventListener('mousemove', (event) => {
+        const scrollable = scroller.scrollHeight > scroller.clientHeight;
+        const nearEdge = scrollable && scroller.getBoundingClientRect().right - event.clientX <= 24;
+        scroller.classList.toggle('is-scrollbar-hot', nearEdge);
+      });
+      scroller.addEventListener('mouseleave', () => {
+        scroller.classList.remove('is-scrollbar-hot');
+      });
+    }
     els.projectsMore?.addEventListener('click', () => {
       mostrarTodosLosProyectos = !mostrarTodosLosProyectos;
       renderProyectos();

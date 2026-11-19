@@ -3750,7 +3750,13 @@ ipcMain.handle('prefs:set', async (_event, patchOriginal) => {
   if (patch && patch.remoteToken === MASCARA_SECRETO) delete patch.remoteToken;
   if (patch && typeof patch === 'object') {
     const cambiaElTema =
-      'theme' in patch || 'themeContrast' in patch || 'accent' in patch;
+      'theme' in patch ||
+      'themeContrast' in patch ||
+      'darkPreset' in patch ||
+      'lightPreset' in patch ||
+      'themeColors' in patch ||
+      'lightThemeColors' in patch ||
+      'accent' in patch;
     state.prefs = { ...state.prefs, ...patch };
     // Una clave o una URL nueva cambia qué proveedores responden.
     invalidarCatalogoProveedores();
