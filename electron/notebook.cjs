@@ -104,7 +104,17 @@ function aplicarAccion(cuaderno, args) {
         return { error: `cellIndex fuera de rango (0-${Math.max(0, celda.length - 1)}).` };
       }
       if (args?.cellType) {
-        celda[indice].cell_type = String(args.cellType) === 'markdown' ? 'markdown' : 'code';
+        const tipo = String(args.cellType) === 'markdown' ? 'markdown' : 'code';
+        celda[indice].cell_type = tipo;
+        // nbformat exige outputs/execution_count en celdas code y prohíbe
+        // salidas en markdown; al cambiar de tipo hay que normalizar.
+        if (tipo === 'markdown') {
+          delete celda[indice].outputs;
+          delete celda[indice].execution_count;
+        } else {
+          celda[indice].outputs ??= [];
+          celda[indice].execution_count ??= null;
+        }
       }
       if (args?.cellContent !== undefined) {
         celda[indice].source = fuenteDesde(args.cellContent);

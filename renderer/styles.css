@@ -1012,6 +1012,27 @@ button {
   color: var(--foreground);
 }
 
+.conversation.is-busy {
+  color: var(--foreground);
+}
+
+.conversation.is-busy .conversation__time {
+  display: none;
+}
+
+.conversation.is-busy::after {
+  content: '●';
+  margin-left: auto;
+  color: var(--primary);
+  font-size: 10px;
+  animation: conversation-busy 1s ease-in-out infinite alternate;
+}
+
+@keyframes conversation-busy {
+  from { opacity: 0.35; }
+  to { opacity: 1; }
+}
+
 .conversation.is-active {
   /* Token, no el literal oscuro: en claro necesita su equivalente. */
   background-color: var(--secondary);

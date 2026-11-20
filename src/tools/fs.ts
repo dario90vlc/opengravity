@@ -55,7 +55,11 @@ export const readFileTool = defineTool({
     }
 
     const absolute = resolvePath(ctx.cwd, path);
-    const maxBytes = Number(args['maxBytes'] ?? args['MaxBytes'] ?? 200_000);
+    const maxBytesRaw = Number(args['maxBytes'] ?? args['MaxBytes'] ?? 200_000);
+    if (!Number.isFinite(maxBytesRaw) || maxBytesRaw <= 0) {
+      return { content: '`maxBytes` debe ser un número positivo.', isError: true };
+    }
+    const maxBytes = Math.floor(maxBytesRaw);
 
     const info = await stat(absolute);
     if (info.isDirectory()) {
@@ -80,9 +84,14 @@ export const readFileTool = defineTool({
     if (pideRango) {
       const lineas = content.split('\n');
       const total = lineas.length;
+      const desdeRaw = startLineRaw === undefined ? 1 : Number(startLineRaw);
+      const hastaRaw = endLineRaw === undefined ? null : Number(endLineRaw);
+      if (!Number.isFinite(desdeRaw) || desdeRaw < 1 || (hastaRaw !== null && (!Number.isFinite(hastaRaw) || hastaRaw < 1))) {
+        return { content: '`startLine` y `endLine` deben ser enteros positivos.', isError: true };
+      }
 
-      const desde = Math.max(1, Math.floor(Number(startLineRaw ?? 1)));
-      const hasta = Math.min(total, Math.floor(Number(endLineRaw ?? desde + 199)));
+      const desde = Math.max(1, Math.floor(desdeRaw));
+      const hasta = Math.min(total, Math.floor(hastaRaw ?? desde + 199));
       if (hasta < desde) {
         return {
           content: `Rango vacío: startLine ${desde} es mayor que endLine ${hasta} (el fichero tiene ${total} líneas).`,

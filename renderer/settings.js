@@ -1323,7 +1323,8 @@
         desc: 'Terminal y ficheros de un host SSH. La clave se usa solo para autenticar; no se guarda ningún secreto. El modo directo requiere WinFsp + SSHFS-Win.',
         rows: (() => {
           const ssh = { ...(DEFAULTS.ssh ?? {}), ...(prefs.ssh ?? {}) };
-          const actualizar = (clave, valor) => setPref('ssh', { ...ssh, [clave]: valor });
+          const actualizar = (clave, valor) =>
+            setPref('ssh', { ...(DEFAULTS.ssh ?? {}), ...(prefs.ssh ?? {}), [clave]: valor });
           return [
             makeRow({ label: 'Host', desc: 'Nombre o IP del servidor.', control: makeInput({ value: ssh.host, placeholder: '127.0.0.1', onCommit: (value) => actualizar('host', value.trim()) }) }),
             makeRow({ label: 'Port', desc: 'Puerto SSH.', control: makeInput({ value: String(ssh.port), placeholder: '22', onCommit: (value) => actualizar('port', Number(value) || 22) }) }),
@@ -1915,7 +1916,7 @@
       placeholder: 'github.com\napi.openai.com',
       onCommit: (value) =>
         setPref('networkRules', {
-          ...rules,
+          ...(prefs.networkRules ?? {}),
           allow: value.split('\n').map((line) => line.trim()).filter(Boolean),
         }),
     });
@@ -1925,7 +1926,7 @@
       placeholder: 'example.com',
       onCommit: (value) =>
         setPref('networkRules', {
-          ...rules,
+          ...(prefs.networkRules ?? {}),
           deny: value.split('\n').map((line) => line.trim()).filter(Boolean),
         }),
     });

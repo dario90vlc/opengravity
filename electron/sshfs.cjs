@@ -38,9 +38,9 @@ async function montar(config) {
     '-o', 'port=' + config.port,
     '-o', 'uid=-1',
     '-o', 'gid=-1',
-    '-o', 'umask=000',
-    '-o', 'create_umask=000',
-    '-o', 'allow_other',
+    // El montaje remoto no debe quedar escribible por otras cuentas locales.
+    '-o', 'umask=077',
+    '-o', 'create_umask=077',
     `${config.user}@${config.host}:${config.remotePath}`,
     `${letra}:`,
   ];

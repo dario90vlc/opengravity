@@ -1,7 +1,7 @@
 {
   "name": "opengravity",
   "productName": "Opengravity",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "IDE con agentes multi-proveedor — app de escritorio open source",
   "license": "MIT",

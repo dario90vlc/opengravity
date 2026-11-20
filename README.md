@@ -52,6 +52,91 @@ A standalone Electron app — not an extension — with **Monaco** as the editor
 > proprietary product. See `docs/analysis/` and `docs/design-tokens.md` for the
 > reference analysis that informed the design decisions.
 
+
+### What changed in 0.3.0
+
+0.3.0 is the security and reliability release. It keeps the 0.2.0 interface
+and capabilities, and closes the failure modes found in the full audit.
+
+**Security**
+
+- Parameter aliases (`Path`, `filePath`, `dirPath`) are normalized before the
+  workspace sandbox and the permission/diff layer, so they can no longer bypass
+  either.
+- Symlinks and junctions are resolved before authorizing a path; old roots are
+  revoked when the workspace or conversation changes.
+- SFTP downloads reject names with separators or `..` and verify the local
+  destination stays inside the mirror.
+- MCP tools now go through permissions **and** the security monitor; generic
+  MCP resource/prompt tools are covered too.
+- The agent browser has its own partition and a local HTTP(S) proxy that
+  resolves and pins every connection, revalidates redirects and blocks
+  loopback/private/link-local targets. Flow and the user's browser stay in
+  separate partitions.
+- `fetch_url`, `search_web`, external/browser opens and embedding endpoints
+  validate destinations against DNS and network rules; DNS rebinding is no
+  longer enough to reach a local service.
+- API keys and the remote token are masked in `prefs:get`; SSH host keys are
+  persisted as TOFU and checked on later connections; SSHFS mounts use `077`.
+- The secret scanner/redactor now covers Windows credential paths, PEM private
+  keys and unquoted secret assignments.
+
+**Reliability and data safety**
+
+- A turn reserves `busy` before the first async step, preventing double sends
+  and session loads during preparation.
+- Provider streams are no longer cut at 45 s; only headers have that timeout,
+  and response bodies keep flowing until completion or the agent idle timeout.
+- Tool cancellation is hard: an in-flight tool gets an abort signal and the
+  turn is released even if the tool ignores it. Interactive tools have
+  user-appropriate timeouts.
+- Subagents capture session, turn and workspace; results/events/checkpoints are
+  routed to the originating conversation, and stale tools cannot write to a
+  newer session.
+- Session loading, revert, project/workspace changes, deletion and new turns
+  are serialized with explicit guards; undo cannot rewrite a different session.
+- JSONL mutations share a queue and unique temp files; a missing/corrupt index
+  is rebuilt from the session files and `.meta.json` sidecars keep
+  provider/model/cwd.
+- Trajectory loading, `turno` persistence, empty-write protection and partial
+  revert failures are fixed; deleting a conversation also deletes its
+  trajectory.
+- LSP rename and quick fixes apply edits to the buffer known by the server,
+  not to a stale disk copy; versions stay in sync.
+- Indexer builds have a single root/queue and no longer retain full file
+  contents; concurrent builds and stale searches are handled.
+- Context compaction and the classifier retry have their own timeouts and
+  honor an already-aborted signal.
+- Scheduled cron edits are serialized; impossible expressions are rejected;
+  `IsDaemon` is persisted and non-daemon recurring jobs created by the agent are
+  stopped at turn end.
+- Plan mode accepts user corrections as interruptions and hands control back to
+  the planner.
+
+**Product and interface**
+
+- Conversation switching while busy is blocked with a clear notice and a busy
+  marker; intentional Stop no longer paints a red provider error.
+- Internal `<USER_REQUEST>`/`<ADDITIONAL_METADATA>` wrappers are hidden from
+  saved conversations; `file://` links open in the editor.
+- Unsaved editor tabs ask before closing; attachment reads complete before
+  sending; scheduled tasks no longer overwrite the composer; cancelled diff
+  cards are cleaned; PTY output includes `[exit N]` and interrupts the active
+  PTY; remote prompts keep the user's draft.
+- Markdown streaming renders at frame rate and highlights after the message
+  ends.
+- Search skips non-UTF8 files instead of corrupting them and computes line
+  positions in one pass; file reads validate `startLine`, `endLine` and
+  `maxBytes`.
+- OpenAI-compatible endpoints retry without `stream_options` on a 400; Gemini 3
+  thought signatures survive the next function call.
+
+**Tests**
+
+- The suite grew to **601 tests**, including real Python/Go LSP sessions,
+  LSP-buffer rename, DNS-pinned downloads, the browser proxy, corrupt-index
+  recovery, concurrent JSONL writes, SSH TOFU and path aliases.
+
 ### Getting started
 
 Requires **Node 22+**.
@@ -87,9 +172,9 @@ npm run dist
 
 This leaves two files in `release/`:
 
-- **`Opengravity-Setup-0.2.0.exe`**: installer (choose a folder, create Start
+- **`Opengravity-Setup-0.3.0.exe`**: installer (choose a folder, create Start
   Menu and desktop shortcuts).
-- **`Opengravity-0.2.0.exe`**: portable, runs without installing.
+- **`Opengravity-0.3.0.exe`**: portable, runs without installing.
 
 `npm run dist:dir` builds only the unpacked app (`release/win-unpacked`), useful
 for inspecting the contents without installing. Executables are not versioned:
@@ -110,13 +195,13 @@ downloaded is the one that was published:
 
 ```powershell
 # 1) Hash of the downloaded file
-Get-FileHash "Opengravity-Setup-0.2.0.exe" -Algorithm SHA256
+Get-FileHash "Opengravity-Setup-0.3.0.exe" -Algorithm SHA256
 
 # 2) Compare it with the published release hash
 Get-Content SHA256SUMS.txt
 
 # 3) If they match, remove the “downloaded from the internet” mark
-Unblock-File "Opengravity-Setup-0.2.0.exe"
+Unblock-File "Opengravity-Setup-0.3.0.exe"
 ```
 
 If the hash does not match, do not install it: it is not the published file.
@@ -250,6 +335,8 @@ app
 │   ├── main.cjs          window, IPC, agent, git, terminal, LSP, app:// protocol
 │   ├── preload.cjs       contextBridge bridge
 │   ├── tools-extra.cjs   main-process tools
+│   ├── red-segura.cjs    DNS pinning and private-network rejection
+│   ├── browser-proxy.cjs local HTTP(S) proxy for the agent browser
 │   ├── diff.cjs          line diff
 │   └── lsp.cjs           LSP client (Content-Length)
 ├── renderer/
@@ -395,6 +482,15 @@ It covers the agent engine, not the interface:
 | `subagents.test.mjs` | Definitions, discovery and selective `kill` |
 | `plan-mode.test.mjs` | The four cycle phases and their gates |
 | `loop.test.mjs` | Gate, injection, pace monitor, parallelism and timeouts |
+| `lsp-buffer.test.mjs` | LSP buffer tracking used by rename/quick fixes |
+| `red-segura.test.mjs` | DNS rebinding rejection and pinned downloads |
+| `browser-proxy.test.mjs` | Agent browser proxy blocks loopback/private targets |
+| `http-stream.test.mjs` | Header timeout does not cut a long response body |
+| `sesiones-contenido.test.mjs` | Concurrent JSONL writes and corrupt-index recovery |
+| `ssh.test.mjs` | SSH fingerprint precedence and TOFU fallback |
+| `rutas.test.mjs` | Workspace path authorization and symlink escape |
+| `tools-edit.test.mjs` | Literal `$&` replacement and CRLF edits |
+| `tools-fs.test.mjs` | `startLine`/`maxBytes` validation |
 
 ### License
 
@@ -423,6 +519,89 @@ Aplicación Electron propia — no una extensión — con **Monaco** como editor
 > Proyecto independiente. No contiene código, assets ni branding de ningún
 > producto propietario. Ver `docs/analysis/` y `docs/design-tokens.md` para el
 > análisis de referencia que motivó las decisiones de diseño.
+
+
+### Qué cambia en 0.3.0
+
+0.3.0 es la versión de seguridad y fiabilidad. Mantiene la interfaz y las
+capacidades de 0.2.0 y cierra los fallos encontrados en la auditoría completa.
+
+**Seguridad**
+
+- Los alias de parámetros (`Path`, `filePath`, `dirPath`) se normalizan antes
+  del sandbox, los permisos y el diff; ya no pueden saltarse ninguno.
+- Symlinks y junctions se resuelven antes de autorizar una ruta; las raíces
+  viejas se revocan al cambiar de workspace o de conversación.
+- Las descargas SFTP rechazan nombres con separadores o `..` y comprueban que
+  el destino quede dentro del espejo.
+- Las tools MCP pasan por permisos **y** por el monitor de seguridad, también
+  las genéricas de recursos/prompts.
+- El navegador del agente tiene partición propia y un proxy HTTP(S) local que
+  resuelve y fija cada conexión, revalida redirecciones y bloquea loopback,
+  rangos privados y link-local. Flow y el navegador del usuario quedan en
+  particiones separadas.
+- `fetch_url`, `search_web`, aperturas externas/navegador y endpoints de
+  embeddings validan destino por DNS y reglas de red; el DNS rebinding ya no
+  basta para alcanzar un servicio local.
+- Las claves API y el token remoto se enmascaran en `prefs:get`; las huellas
+  SSH se guardan como TOFU y se comparan; los montajes SSHFS usan `077`.
+- El detector/redactor de secretos cubre rutas de credenciales de Windows,
+  claves PEM y asignaciones de secretos sin comillas.
+
+**Fiabilidad y datos**
+
+- El turno reserva `busy` antes del primer `await`, evitando dobles envíos y
+  cargas de sesión durante la preparación.
+- Los streams de proveedor ya no se cortan a los 45 s: solo las cabeceras
+  tienen ese timeout y el cuerpo sigue hasta terminar o hasta el timeout de
+  inactividad del agente.
+- La cancelación de tools es dura: reciben señal y el turno se libera aunque
+  ignoren el abort. Las tools interactivas tienen timeouts adecuados.
+- Los subagentes capturan sesión, turno y workspace; resultados, eventos y
+  checkpoints vuelven a la conversación de origen, y una tool vieja no puede
+  escribir en una sesión nueva.
+- Carga de sesión, revert, cambio de proyecto/workspace, borrado y turnos
+  nuevos están serializados con guardas; un undo no puede reescribir otra
+  sesión.
+- Las mutaciones JSONL comparten cola y temporales únicos; un índice
+  perdido/corrupto se reconstruye desde las sesiones y los sidecars
+  `.meta.json` conservan provider/model/cwd.
+- Se cargan las trayectorias al abrir sesión, se persiste `turno`, se evita
+  sobrescribir con una trayectoria vacía, se respetan fallos parciales y borrar
+  una conversación borra su trayectoria.
+- LSP rename y quick fixes aplican sobre el buffer que conoce el servidor, no
+  sobre un disco obsoleto; las versiones quedan sincronizadas.
+- El indexer tiene un único root/cola y ya no retiene el contenido completo de
+  los ficheros; se manejan builds concurrentes y búsquedas obsoletas.
+- La compactación de contexto y el reintento del clasificador tienen timeout
+  propio y respetan una señal ya abortada.
+- Las ediciones de tareas programadas están serializadas; las expresiones
+  imposibles se rechazan; `IsDaemon` se persiste y los cron recurrentes
+  no-daemon creados por el agente se apagan al cerrar el turno.
+- Plan mode acepta correcciones del usuario como interrupciones y devuelve el
+  control al planificador.
+
+**Producto e interfaz**
+
+- Cambiar de conversación mientras trabaja queda bloqueado con aviso y marca de
+  ocupación; Detener ya no pinta un error rojo del proveedor.
+- Los envoltorios internos `<USER_REQUEST>`/`<ADDITIONAL_METADATA>` se ocultan
+  en conversaciones guardadas; los enlaces `file://` abren el editor.
+- Las pestañas con cambios piden confirmación al cerrar; los adjuntos terminan
+  de leerse antes de enviar; las tareas programadas no pisan el compositor; las
+  tarjetas de diff canceladas se limpian; el PTY muestra `[exit N]` e
+  interrumpe el PTY activo; los prompts remotos respetan el borrador.
+- El Markdown en streaming se pinta por frame y se resalta al terminar.
+- La búsqueda omite ficheros no-UTF8 en vez de corromperlos y calcula líneas en
+  una sola pasada; `startLine`, `endLine` y `maxBytes` se validan.
+- Los endpoints OpenAI-compatible reintentan sin `stream_options` ante un 400;
+  las firmas de pensamiento de Gemini 3 sobreviven a la siguiente llamada.
+
+**Pruebas**
+
+- La suite crece a **601 tests**, con LSP real de Python/Go, rename con buffer
+  LSP, descargas con DNS fijado, proxy del navegador, recuperación de índice
+  corrupto, escrituras JSONL concurrentes, TOFU SSH y alias de rutas.
 
 ### Arrancar
 
@@ -458,9 +637,9 @@ npm run dist
 
 Deja dos ficheros en `release/`:
 
-- **`Opengravity-Setup-0.2.0.exe`**: instalador (elige carpeta, acceso directo
+- **`Opengravity-Setup-0.3.0.exe`**: instalador (elige carpeta, acceso directo
   en el menú Inicio y en el escritorio).
-- **`Opengravity-0.2.0.exe`**: portable, se ejecuta sin instalar.
+- **`Opengravity-0.3.0.exe`**: portable, se ejecuta sin instalar.
 
 `npm run dist:dir` genera solo la aplicación desempaquetada (`release/win-unpacked`),
 útil para comprobar el contenido sin instalar. Los ejecutables no se versionan:
@@ -481,13 +660,13 @@ el fichero que bajaste es el que se publicó:
 
 ```powershell
 # 1) Huella del fichero descargado
-Get-FileHash "Opengravity-Setup-0.2.0.exe" -Algorithm SHA256
+Get-FileHash "Opengravity-Setup-0.3.0.exe" -Algorithm SHA256
 
 # 2) Compárala con la que se publicó junto a la release
 Get-Content SHA256SUMS.txt
 
 # 3) Si coincide, quita la marca de «descargado de internet»
-Unblock-File "Opengravity-Setup-0.2.0.exe"
+Unblock-File "Opengravity-Setup-0.3.0.exe"
 ```
 
 Si la huella no coincide, no lo instales: no es el fichero publicado. Y si

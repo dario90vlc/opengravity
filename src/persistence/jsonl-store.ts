@@ -14,7 +14,7 @@
  * módulo se sustituye por una implementación SQLite sin tocar el agente.
  */
 
-import { appendFile, mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { Message } from '../providers/types.js';
@@ -30,6 +30,12 @@ interface StoredLine {
   message: Message;
 }
 
+let contadorTemporal = 0;
+function rutaTemporal(ruta: string): string {
+  contadorTemporal += 1;
+  return `${ruta}.${process.pid}.${Date.now().toString(36)}.${contadorTemporal}.tmp`;
+}
+
 export interface JsonlStoreOptions {
   /** Directorio raíz. Por defecto `~/.agent-ide`. */
   root?: string;
@@ -39,11 +45,38 @@ export class JsonlSessionStore implements SessionStore {
   private readonly root: string;
   private readonly sessionsDir: string;
   private readonly indexPath: string;
+  /** Serializa las mutaciones del índice: read-modify-write no es atómico. */
+  private cola: Promise<void> = Promise.resolve();
 
   constructor(options: JsonlStoreOptions = {}) {
     this.root = options.root ?? defaultRoot();
     this.sessionsDir = join(this.root, 'sessions');
     this.indexPath = join(this.root, 'index.json');
+
+    /*
+     * Se envuelven los métodos mutadores una sola vez. Así cada cuerpo conserva
+     * su lógica y ninguna llamada puede leer el índice mientras otra lo escribe.
+     */
+    const metodos = [
+      'create',
+      'append',
+      'rewrite',
+      'rename',
+      'setProject',
+      'delete',
+      'repararContenidoObjeto',
+    ] as const;
+    for (const metodo of metodos) {
+      const original = (this[metodo] as (...args: unknown[]) => Promise<unknown>).bind(this);
+      (this as unknown as Record<string, unknown>)[metodo] = (...args: unknown[]) =>
+        this.encolar(() => original(...args));
+    }
+  }
+
+  private encolar<T>(fn: () => Promise<T>): Promise<T> {
+    const siguiente = this.cola.then(fn);
+    this.cola = siguiente.then(() => {}, () => {});
+    return siguiente;
   }
 
   async create(init: SessionInit): Promise<SessionMeta> {
@@ -63,6 +96,7 @@ export class JsonlSessionStore implements SessionStore {
     };
 
     await writeFile(this.sessionPath(meta.id), '', 'utf8');
+    await this.escribirMeta(meta);
 
     const index = await this.readIndex();
     index.unshift(meta);
@@ -88,7 +122,11 @@ export class JsonlSessionStore implements SessionStore {
       lines.push(JSON.stringify(record));
     }
 
-    await appendFile(this.sessionPath(id), `${lines.join('\n')}\n`, 'utf8');
+    /*
+     * Prefijo de salto: si el proceso murió a mitad de la línea anterior, sin
+     * él la línea nueva se pega a la rota y `load` descarta ambas.
+     */
+    await appendFile(this.sessionPath(id), `\n${lines.join('\n')}\n`, 'utf8');
 
     meta.messageCount += messages.length;
     meta.updatedAt = now;
@@ -101,6 +139,7 @@ export class JsonlSessionStore implements SessionStore {
 
     index.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
     await this.writeIndex(index);
+    await this.escribirMeta(meta);
   }
 
   async load(id: string): Promise<Session> {
@@ -133,7 +172,7 @@ export class JsonlSessionStore implements SessionStore {
       }
     }
 
-    return { meta, messages };
+    return { meta, messages: repararParejasDeHerramientas(messages) };
   }
 
   async list(): Promise<SessionMeta[]> {
@@ -155,13 +194,14 @@ export class JsonlSessionStore implements SessionStore {
       .map((message) => JSON.stringify({ at: now, message } satisfies StoredLine))
       .join('\n');
 
-    const temporary = `${this.sessionPath(id)}.tmp`;
+    const temporary = rutaTemporal(this.sessionPath(id));
     await writeFile(temporary, body.length > 0 ? `${body}\n` : '', 'utf8');
     await rename(temporary, this.sessionPath(id));
 
     meta.messageCount = messages.length;
     meta.updatedAt = now;
     await this.writeIndex(index);
+    await this.escribirMeta(meta);
   }
 
   /** Cambia el título de una sesión en el índice. */
@@ -173,6 +213,7 @@ export class JsonlSessionStore implements SessionStore {
     found.title = title;
     found.updatedAt = new Date().toISOString();
     await this.writeIndex(index);
+    await this.escribirMeta(found);
   }
 
   /** Cambia el proyecto de una sesión sin tocar sus mensajes. */
@@ -183,6 +224,7 @@ export class JsonlSessionStore implements SessionStore {
     meta.project = project;
     meta.updatedAt = new Date().toISOString();
     await this.writeIndex(index);
+    await this.escribirMeta(meta);
   }
 
   async delete(id: string): Promise<void> {
@@ -194,6 +236,7 @@ export class JsonlSessionStore implements SessionStore {
     }
 
     await rm(this.sessionPath(id), { force: true });
+    await rm(this.metaPath(id), { force: true });
   }
 
   async latest(): Promise<SessionMeta | undefined> {
@@ -209,6 +252,22 @@ export class JsonlSessionStore implements SessionStore {
    * la carpeta de sesiones. Los ids los genera la app, así que un id con
    * separadores o `..` solo puede venir de fuera: se rechaza.
    */
+  /** Fichero lateral con los metadatos, para reconstruir el índice sin pérdida. */
+  private metaPath(id: string): string {
+    return `${this.sessionPath(id).replace(/\.jsonl$/, '')}.meta.json`;
+  }
+
+  private async escribirMeta(meta: SessionMeta): Promise<void> {
+    const ruta = this.metaPath(meta.id);
+    const temporal = rutaTemporal(ruta);
+    try {
+      await writeFile(temporal, JSON.stringify(meta, null, 2), 'utf8');
+      await rename(temporal, ruta);
+    } catch {
+      await rm(temporal, { force: true }).catch(() => {});
+    }
+  }
+
   private sessionPath(id: string): string {
     const limpio = String(id ?? '');
     if (!/^[A-Za-z0-9._-]+$/.test(limpio) || limpio === '.' || limpio === '..') {
@@ -269,7 +328,7 @@ export class JsonlSessionStore implements SessionStore {
 
       if (tocado === 0) continue;
 
-      const temporal = `${ruta}.tmp`;
+      const temporal = rutaTemporal(ruta);
       await writeFile(temporal, lineas.join('\n'), 'utf8');
       await rename(temporal, ruta);
       ficheros += 1;
@@ -283,19 +342,127 @@ export class JsonlSessionStore implements SessionStore {
     try {
       const raw = await readFile(this.indexPath, 'utf8');
       const parsed = JSON.parse(raw) as unknown;
-      return Array.isArray(parsed) ? (parsed as SessionMeta[]) : [];
+      if (!Array.isArray(parsed)) throw new Error('índice con formato inválido');
+      return parsed as SessionMeta[];
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') {
+        // Puede que el índice se haya perdido; los JSONL siguen ahí.
+        return this.reconstruirIndice();
+      }
+      /*
+       * Un índice corrupto no puede convertirse silenciosamente en []: el
+       * siguiente `create` borraría todas las sesiones del listado. Se aparta
+       * el fichero y se reconstruye desde los JSONL, que siguen intactos.
+       */
+      await rename(this.indexPath, `${this.indexPath}.corrupt-${Date.now()}`).catch(() => {});
+      return this.reconstruirIndice();
+    }
+  }
+
+  /** Reconstruye metadatos mínimos desde los ficheros de sesión. */
+  private async reconstruirIndice(): Promise<SessionMeta[]> {
+    let nombres: string[];
+    try {
+      nombres = await readdir(this.sessionsDir);
     } catch {
       return [];
     }
+
+    const recuperadas: SessionMeta[] = [];
+    for (const nombre of nombres) {
+      if (!nombre.endsWith('.jsonl')) continue;
+      const id = nombre.slice(0, -'.jsonl'.length);
+      const ruta = join(this.sessionsDir, nombre);
+      try {
+        const info = await stat(ruta);
+        const crudo = await readFile(ruta, 'utf8');
+        let mensajes = 0;
+        let titulo = 'Nueva conversación';
+        let sidecar: SessionMeta | null = null;
+        try {
+          sidecar = JSON.parse(await readFile(this.metaPath(id), 'utf8')) as SessionMeta;
+        } catch {
+          sidecar = null;
+        }
+        for (const linea of crudo.split('\n')) {
+          if (linea.trim().length === 0) continue;
+          mensajes += 1;
+          if (titulo === 'Nueva conversación') {
+            try {
+              const registro = JSON.parse(linea) as StoredLine;
+              if (registro?.message?.role === 'user') {
+                titulo = titleFrom(registro.message.content);
+              }
+            } catch {
+              // línea corrupta: se cuenta igual, no se pierde el resto
+            }
+          }
+        }
+        recuperadas.push({
+          id,
+          title: sidecar?.title || titulo,
+          createdAt: sidecar?.createdAt || info.birthtime.toISOString(),
+          updatedAt: sidecar?.updatedAt || info.mtime.toISOString(),
+          provider: sidecar?.provider ?? '',
+          model: sidecar?.model ?? '',
+          // Sin sidecar no hay cwd original; uno válido evita que abrir la
+          // sesión deje el workspace en una ruta vacía.
+          cwd: sidecar?.cwd || process.cwd(),
+          project: sidecar?.project ?? null,
+          messageCount: mensajes,
+        });
+      } catch {
+        // fichero ilegible: se omite
+      }
+    }
+
+    recuperadas.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    return recuperadas;
   }
 
   /** Escribe el índice de forma atómica: temporal + rename. */
   private async writeIndex(index: SessionMeta[]): Promise<void> {
     await this.ensureDirs();
-    const temporary = `${this.indexPath}.tmp`;
+    const temporary = rutaTemporal(this.indexPath);
     await writeFile(temporary, JSON.stringify(index, null, 2), 'utf8');
     await rename(temporary, this.indexPath);
   }
+}
+
+/**
+ * Una escritura interrumpida puede dejar un `assistant.toolCalls` sin sus
+ * mensajes `tool`. Los proveedores rechazan ese historial con 400, así que se
+ * eliminan las llamadas huérfanas (y los resultados sin llamada) al cargar.
+ */
+function repararParejasDeHerramientas(messages: Message[]): Message[] {
+  const llamadas = new Set<string>();
+  const resultados = new Set<string>();
+
+  for (const message of messages) {
+    for (const call of message.toolCalls ?? []) {
+      if (call.id) llamadas.add(call.id);
+    }
+    if (message.role === 'tool' && message.toolCallId) resultados.add(message.toolCallId);
+  }
+
+  const salida: Message[] = [];
+  for (const message of messages) {
+    if (message.role === 'assistant' && message.toolCalls?.length) {
+      const validas = message.toolCalls.filter((call) => call.id && resultados.has(call.id));
+      if (validas.length === 0) {
+        const { toolCalls: _descartadas, ...sinLlamadas } = message;
+        salida.push(sinLlamadas);
+      } else {
+        salida.push(validas.length === message.toolCalls.length ? message : { ...message, toolCalls: validas });
+      }
+      continue;
+    }
+    if (message.role === 'tool' && (!message.toolCallId || !llamadas.has(message.toolCallId))) {
+      continue;
+    }
+    salida.push(message);
+  }
+  return salida;
 }
 
 /** Id legible y ordenable: `20260103-141230-ab12cd`. */

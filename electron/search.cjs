@@ -104,13 +104,37 @@ function lineaEn(texto, indice) {
  */
 function buscarEnContenido(contenido, buscador, ruta, limite = MAX_RESULTADOS) {
   const resultados = [];
+  // Una sola pasada para los inicios de línea; antes se recorría el fichero
+  // entero por cada coincidencia.
+  const inicios = [0];
+  for (let i = 0; i < contenido.length; i += 1) {
+    if (contenido.charCodeAt(i) === 10) inicios.push(i + 1);
+  }
+  const posicion = (indice) => {
+    let bajo = 0;
+    let alto = inicios.length - 1;
+    while (bajo <= alto) {
+      const medio = Math.floor((bajo + alto) / 2);
+      if (inicios[medio] <= indice) bajo = medio + 1;
+      else alto = medio - 1;
+    }
+    const lineaIndex = Math.max(0, alto);
+    return {
+      linea: lineaIndex + 1,
+      columna: indice - inicios[lineaIndex] + 1,
+      texto: contenido.slice(
+        inicios[lineaIndex],
+        lineaIndex + 1 < inicios.length ? inicios[lineaIndex + 1] - 1 : contenido.length,
+      ),
+    };
+  };
   for (const hallazgo of buscador(contenido)) {
-    const { linea, columna } = posicionDe(contenido, hallazgo.indice);
+    const ubicacion = posicion(hallazgo.indice);
     resultados.push({
       ruta,
-      linea,
-      columna,
-      texto: lineaEn(contenido, hallazgo.indice),
+      linea: ubicacion.linea,
+      columna: ubicacion.columna,
+      texto: ubicacion.texto,
       coincidencia: hallazgo.texto,
       indice: hallazgo.indice,
       longitud: hallazgo.longitud,

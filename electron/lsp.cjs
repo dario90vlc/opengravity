@@ -125,6 +125,7 @@ class LspClient {
     this.nextId = 1;
     this.pending = new Map();
     this.opened = new Map(); // uri -> version
+    this.textos = new Map(); // uri -> último buffer enviado al servidor
     this.diagnostics = new Map(); // uri -> diagnósticos
     this.ready = false;
     this.onDiagnostics = options.onDiagnostics ?? (() => {});
@@ -138,14 +139,27 @@ class LspClient {
 
     this.child.stdout.on('data', (chunk) => this.consume(chunk));
     this.child.stderr.on('data', (chunk) => this.onLog(String(chunk).slice(0, 400)));
+    this.child.stdin?.on('error', () => {});
+
+    // Sin esto, una petición en vuelo espera los 15 s aunque el servidor haya
+    // muerto; el SIGKILL de OOM es el caso típico.
+    const fallarPendientes = (motivo) => {
+      for (const [, entry] of this.pending) {
+        clearTimeout(entry.timer);
+        entry.reject(new Error(motivo));
+      }
+      this.pending.clear();
+    };
 
     this.child.on('error', (error) => {
       this.onLog(`no se pudo arrancar ${command}: ${error.message}`);
       this.ready = false;
+      fallarPendientes(`servidor LSP no disponible: ${error.message}`);
     });
 
     this.child.on('exit', () => {
       this.ready = false;
+      fallarPendientes('servidor LSP terminó');
     });
 
     const rootUri = pathToFileURL(this.rootPath).href;
@@ -202,6 +216,7 @@ class LspClient {
       return;
     }
     this.opened.set(uri, 1);
+    this.textos.set(uri, text);
     this.notify('textDocument/didOpen', {
       textDocument: {
         uri,
@@ -216,6 +231,7 @@ class LspClient {
   didChange(uri, text) {
     const version = (this.opened.get(uri) ?? 0) + 1;
     this.opened.set(uri, version);
+    this.textos.set(uri, text);
     this.notify('textDocument/didChange', {
       textDocument: { uri, version },
       contentChanges: [{ text }],
@@ -253,6 +269,11 @@ class LspClient {
       command: comando,
       arguments: argumentos ?? [],
     });
+  }
+
+  /** Último texto que el servidor conoce para un documento abierto. */
+  textoDe(uri) {
+    return this.textos.get(uri);
   }
 
   /** Diagnósticos conocidos de un fichero. */
@@ -378,6 +399,7 @@ class LspClient {
       entry.reject(new Error('servidor LSP cerrado'));
     }
     this.pending.clear();
+    this.textos.clear();
 
     try {
       this.notify('shutdown', null);

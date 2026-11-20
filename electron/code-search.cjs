@@ -30,6 +30,12 @@ function makeCodeSearchTool(codeIndex, getCwd) {
       const base = ctx?.cwd ?? getCwd();
 
       if (codeIndex.size === 0 || codeIndex.root !== base) await codeIndex.build(base);
+      if (codeIndex.root !== base) {
+        return {
+          content: 'El índice del proyecto aún se está construyendo. Inténtalo de nuevo en unos segundos.',
+          isError: true,
+        };
+      }
 
       const mode = String(args.mode ?? 'auto');
       const limit = Math.min(30, Number(args.limit ?? 10));

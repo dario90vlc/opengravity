@@ -29,7 +29,7 @@ const ESPERA_IMAGEN_MS = 180_000;
 const INTERVALO_MS = 2_000;
 
 /** Partición persistente donde vive la sesión de Google de la app. */
-const PARTICION_GOOGLE = 'persist:opengravity-browser';
+const PARTICION_GOOGLE = 'persist:opengravity-flow';
 
 /** Cookies con las que Google marca una sesión iniciada. */
 const COOKIE_SESION = /^(SID|SAPISID|APISID|HSID|SSID|__Secure-3PSID|__Secure-1PSID)$/;
@@ -898,7 +898,15 @@ async function generarEnFlow(win, { prompt, destino, esperaMs, aspectRatio } = {
   // Sin esto, Flow puede generar un VÍDEO en vez de una imagen.
   const modo = await seleccionarModoImagen(win);
   anotar('modo', modo);
-  if (modo?.ok) await new Promise((r) => setTimeout(r, 1500));
+  if (!modo?.ok) {
+    return {
+      ok: false,
+      error:
+        'Flow no quedó en modo Imagen; aborto para no generar un vídeo. ' +
+        (modo?.error ?? 'No encontré el conmutador de modo.'),
+    };
+  }
+  await new Promise((r) => setTimeout(r, 1500));
 
   const previas = await instantaneaDeImagenes(win);
 

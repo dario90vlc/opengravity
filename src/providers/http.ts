@@ -44,6 +44,7 @@ export async function* readSSE(
         const rawEvent = buffer.slice(0, separador.index);
         buffer = buffer.slice(separador.index + separador[0].length);
 
+        const datos: string[] = [];
         for (const line of rawEvent.split(/\r?\n/)) {
           const trimmed = line.trimStart();
           if (!trimmed.startsWith('data:')) continue;
@@ -51,9 +52,11 @@ export async function* readSSE(
           const payload = trimmed.slice(5).trim();
           if (payload.length === 0) continue;
           if (payload === '[DONE]') return;
-
-          yield payload;
+          datos.push(payload);
         }
+        // SSE permite partir un JSON en varias líneas `data:`; se unen antes
+        // de parsear, como exige el estándar.
+        if (datos.length > 0) yield datos.join('\n');
 
         separador = /\r?\n\r?\n/.exec(buffer);
       }
@@ -74,11 +77,13 @@ export async function* readSSE(
   }
 
   // Resto sin terminador: algunos servidores no cierran con línea en blanco.
-  const tail = buffer.trim();
-  if (tail.startsWith('data:')) {
-    const payload = tail.slice(5).trim();
-    if (payload.length > 0 && payload !== '[DONE]') yield payload;
-  }
+  const cola = buffer
+    .split(/\r?\n/)
+    .map((linea) => linea.trimStart())
+    .filter((linea) => linea.startsWith('data:'))
+    .map((linea) => linea.slice(5).trim())
+    .filter((linea) => linea.length > 0 && linea !== '[DONE]');
+  if (cola.length > 0) yield cola.join('\n');
 }
 
 /**
@@ -108,6 +113,11 @@ export async function* readNDJSON(
       }
     }
   } finally {
+    try {
+      await reader.cancel();
+    } catch {
+      // el cuerpo ya estaba cerrado
+    }
     reader.releaseLock();
   }
 
@@ -167,8 +177,17 @@ function backoffDelay(attempt: number, baseMs: number): number {
   return Math.min(exponential + jitter, 20_000);
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(done, ms);
+    const alAbortar = () => done();
+    function done(): void {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', alAbortar);
+      resolve();
+    }
+    signal?.addEventListener('abort', alAbortar, { once: true });
+  });
 }
 
 /**
@@ -194,13 +213,30 @@ export async function fetchWithRetry(
   for (let attempt = 1; attempt <= retries + 1; attempt += 1) {
     if (signal?.aborted) throw new ProviderError(providerId, undefined, 'petición cancelada');
 
-    const timeoutSignal = AbortSignal.timeout(attemptTimeout);
-    const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+    /*
+     * El timeout debe gobernar solo la espera de cabeceras. Si se pasa
+     * `AbortSignal.timeout` al fetch, ese signal sigue atado al cuerpo y corta
+     * cualquier stream de más de 45 s; el bucle del agente tiene su propio
+     * timeout por inactividad, mucho más apropiado.
+     */
+    const controlador = new AbortController();
+    const abortarPorSenal = () => controlador.abort();
+    if (signal) {
+      signal.addEventListener('abort', abortarPorSenal, { once: true });
+      if (signal.aborted) controlador.abort();
+    }
+    const temporizador = setTimeout(() => controlador.abort(), attemptTimeout);
+
+    let response;
+    try {
+      response = await fetch(input, { ...init, signal: controlador.signal });
+    } finally {
+      clearTimeout(temporizador);
+    }
 
     try {
-      const response = await fetch(input, { ...init, signal: combinedSignal });
-
       if (response.ok || !RETRYABLE_STATUS.has(response.status) || attempt > retries) {
+        // La escucha se conserva: el mismo signal debe poder cortar el cuerpo.
         return response;
       }
 
@@ -216,14 +252,23 @@ export async function fetchWithRetry(
         `HTTP ${response.status} (reintento ${attempt}/${retries})`,
       );
 
-      await sleep(waitMs);
+      // Cerrar el cuerpo antes de esperar: si no, la conexión queda ocupada.
+      try {
+        await response.body?.cancel();
+      } catch {
+        // el cuerpo ya estaba cerrado
+      }
+
+      signal?.removeEventListener('abort', abortarPorSenal);
+      await sleep(Math.min(waitMs, 60_000), signal);
     } catch (error) {
+      signal?.removeEventListener('abort', abortarPorSenal);
       // Errores de red o timeout de intento: reintentar tiene sentido salvo cancelación explícita.
       if (signal?.aborted) throw error;
 
       lastError = error;
       if (attempt > retries) break;
-      await sleep(backoffDelay(attempt, baseMs));
+      await sleep(backoffDelay(attempt, baseMs), signal);
     }
   }
 

@@ -117,3 +117,40 @@ test('la sesión guarda el proyecto, incluido null para No Project', async () =>
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('appends concurrentes no pierden mensajes ni metadatos', async () => {
+  const { dir, store } = montar();
+  try {
+    const meta = await store.create({ cwd: '/ws', provider: 'openai', model: 'm' });
+    await Promise.all(
+      Array.from({ length: 20 }, (_, i) =>
+        store.append(meta.id, [{ role: 'user', content: `mensaje ${i}` }]),
+      ),
+    );
+    const cargada = await store.load(meta.id);
+    assert.equal(cargada.messages.length, 20);
+    const indexada = (await store.list()).find((s) => s.id === meta.id);
+    assert.equal(indexada.messageCount, 20);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('un índice corrupto se reconstruye desde los JSONL en vez de perder sesiones', async () => {
+  const { dir, store } = montar();
+  try {
+    const meta = await store.create({ cwd: '/ws', provider: 'openai', model: 'm' });
+    await store.append(meta.id, [{ role: 'user', content: 'Hola desde el fichero' }]);
+    fs.writeFileSync(path.join(dir, 'index.json'), '{ roto', 'utf8');
+
+    const lista = await store.list();
+    const recuperada = lista.find((s) => s.id === meta.id);
+    assert.ok(recuperada, 'la sesión debe recuperarse del JSONL');
+    assert.equal(recuperada.messageCount, 1);
+    assert.ok(recuperada.title.length > 0, 'debe conservar un título legible');
+    assert.equal(recuperada.provider, 'openai');
+    assert.equal(recuperada.cwd, '/ws');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

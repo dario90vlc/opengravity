@@ -3,7 +3,8 @@
 **No al 100 %: es todo lo que se puede demostrar en esta máquina.**
 Todo lo que estaba abierto tiene prueba: acceso a ficheros confinado, paridad
 visual medida contra el original, historial de git limpio, un encargo completo
-ejecutado (tres ficheros, terminal, subagente y revert) y 588 pruebas en verde.
+ejecutado (tres ficheros, terminal, subagente y revert) y **601 pruebas en verde**
+(2026-11-20).
 La firma no se paga: se publica la huella SHA-256 de cada ejecutable.
 
 Lo único que **no** se ha probado es macOS y Linux: el desarrollo y toda la
@@ -24,19 +25,23 @@ Comprueba que los ejecutables lleven dentro el código de hoy (comparando
 compilado. Hoy responde:
 
 ```
-OK   el asar lleva los 230 ficheros del código, idénticos byte a byte (más 38 .d.ts ignorados: son tipos)
-OK   release/Opengravity-Setup-0.2.0.exe (96597 KB) es posterior al asar
-AVISO release/Opengravity-Setup-0.2.0.exe: SIN firma Authenticode (Windows dirá «editor desconocido»)
-OK   release/Opengravity-0.2.0.exe (88397 KB) es posterior al asar
-AVISO release/Opengravity-0.2.0.exe: SIN firma Authenticode (Windows dirá «editor desconocido»)
+OK   el asar lleva los 232 ficheros del código, idénticos byte a byte (más 38 .d.ts ignorados: son tipos)
+OK   release/Opengravity-Setup-0.3.0.exe (96615 KB) es posterior al asar
+AVISO release/Opengravity-Setup-0.3.0.exe: SIN firma Authenticode (Windows dirá «editor desconocido»)
+OK   release/Opengravity-0.3.0.exe (88412 KB) es posterior al asar
+AVISO release/Opengravity-0.3.0.exe: SIN firma Authenticode (Windows dirá «editor desconocido»)
 OK   7 fuentes con assets/fonts/OFL.txt al lado
 OK   compilado: dist/index.js
 OK   compilado: dist/agent/loop.js
 ```
 
-Con eso el veredicto es **«entregable, con lo avisado a la vista»**: los 230
+Con eso el veredicto es **«entregable, con lo avisado a la vista»**: los 232
 ficheros del código del paquete coinciden byte a byte con el disco. Lo que queda
 en rojo es la firma, que no es código.
+
+Los binarios **0.3.0** están generados y verificados con
+`npm run verify:release`; las huellas SHA-256 están en
+`release/SHA256SUMS.txt`.
 
 ---
 
@@ -45,8 +50,8 @@ en rojo es la firma, que no es código.
 | Cosa | Cómo se comprobó |
 |---|---|
 | Compila | `npm run build`, sin errores |
-| Pruebas | 588 casos, 0 fallos (2026-11-19) |
-| El paquete lleva el código actual | 230 ficheros comparados byte a byte contra el disco (`npm run verify:release`) |
+| Pruebas | 601 casos, 0 fallos (2026-11-20) |
+| El paquete lleva el código actual | 232 ficheros comparados byte a byte contra el disco (`npm run verify:release`) |
 | Actualizador | `electron-updater` con comprobación de versión, progreso y verificación SHA-256 |
 | El cierre mata sus procesos | Un hijo real de 10 minutos murió y se confirmó antes de devolver el control, en 86 ms |
 | El nivel de pensamiento llega al proveedor | Petición `fetch` interceptada: `reasoning_effort` aparece en el cuerpo real |

@@ -4,6 +4,7 @@ import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import os from 'node:os';
+import fs from 'node:fs';
 
 import { createRequire } from 'node:module';
 
@@ -40,4 +41,30 @@ test('una carpeta abierta desde el diálogo queda autorizada', () => {
   const otra = path.join(os.tmpdir(), 'otra-carpeta');
   rutas.registrarRaiz(otra);
   assert.equal(rutas.rutaAutorizada(cwd, path.join(otra, 'f.txt')), path.join(otra, 'f.txt'));
+});
+
+test('un enlace que sale del workspace se rechaza', (t) => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'rutas-symlink-'));
+  try {
+    const workspace = path.join(base, 'ws');
+    const fuera = path.join(base, 'fuera');
+    fs.mkdirSync(workspace);
+    fs.mkdirSync(fuera);
+    fs.writeFileSync(path.join(fuera, 'secreto.txt'), 'no');
+
+    try {
+      fs.symlinkSync(fuera, path.join(workspace, 'escape'), process.platform === 'win32' ? 'junction' : 'dir');
+    } catch {
+      t.skip('el sistema no permite crear enlaces en esta prueba');
+      return;
+    }
+
+    rutas.registrarRaiz(workspace);
+    assert.throws(
+      () => rutas.rutaAutorizada(workspace, path.join('escape', 'secreto.txt')),
+      /fuera del workspace/,
+    );
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
 });

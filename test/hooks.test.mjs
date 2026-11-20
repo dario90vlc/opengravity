@@ -60,6 +60,15 @@ describe('absolutizarRutas', () => {
       () => absolutizarRutas('run_command', { command: 'ls', cwd: '..' }, () => cwd, true),
       /fuera del workspace/,
     );
+    // Los alias también deben pasar por el sandbox.
+    assert.throws(
+      () => absolutizarRutas('read_file', { filePath: '../fuera.txt' }, () => cwd, true),
+      /fuera del workspace/,
+    );
+    assert.throws(
+      () => absolutizarRutas('write_file', { Path: '../fuera.txt' }, () => cwd, true),
+      /fuera del workspace/,
+    );
   });
 
   test('con el sandbox activo permite una raíz añadida', () => {

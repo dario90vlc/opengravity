@@ -83,8 +83,9 @@ class RemoteProject {
 
   async sincronizar(relativo) {
     if (!this.root || !this.remoteRoot || this.cerrado) return;
-    const local = path.join(this.root, relativo);
-    const remoto = path.posix.join(this.remoteRoot, relativo);
+    const local = path.resolve(this.root, String(relativo));
+    if (local !== this.root && !local.startsWith(this.root + path.sep)) return;
+    const remoto = path.posix.join(this.remoteRoot, String(relativo));
     try {
       const info = await fsp.stat(local).catch(() => null);
       if (!info) {

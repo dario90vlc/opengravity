@@ -58,6 +58,7 @@ function serializar(trayectoria) {
       argumentos: paso.argumentos,
       llamadaId: paso.llamadaId,
       mensaje: paso.mensaje,
+      turno: paso.turno ?? null,
       inicio: paso.inicio,
       fin: paso.fin,
       esError: paso.esError,
@@ -79,6 +80,7 @@ function deserializar(datos, conversacion) {
       argumentos: bruto?.argumentos ?? {},
       llamadaId: typeof bruto?.llamadaId === 'string' ? bruto.llamadaId : null,
       mensaje: bruto?.mensaje ?? null,
+      turno: typeof bruto?.turno === 'number' ? bruto.turno : null,
       inicio: bruto?.inicio,
       fin: bruto?.fin,
       resultado: bruto?.resultado,
@@ -142,6 +144,21 @@ async function volcar(conversacion) {
   const clave = String(conversacion ?? 'sin-conversacion');
   const trayectoria = trayectorias.get(clave);
   if (!trayectoria || !carpetaBase) return;
+  /*
+   * No sobrescribir el fichero con una trayectoria vacía que todavía no se ha
+   * cargado: el primer paso nuevo borraría todos los snapshots anteriores. Si
+   * no existe fichero es una conversación nueva y sí se puede crear.
+   */
+  if (!trayectoria.cargada) {
+    const ruta = rutaDe(clave);
+    if (!ruta) return;
+    try {
+      await fsp.access(ruta);
+      return;
+    } catch {
+      trayectoria.cargada = true;
+    }
+  }
 
   podarPorTamano(trayectoria);
 
@@ -391,6 +408,7 @@ async function revertirCon(conversacion, plan, seleccionar) {
   }
 
   let restaurados = 0;
+  const failures = [];
   for (const [ruta, contenido] of porFichero) {
     try {
       if (contenido === null) {
@@ -399,9 +417,22 @@ async function revertirCon(conversacion, plan, seleccionar) {
         await fsp.writeFile(ruta, contenido, 'utf8');
       }
       restaurados += 1;
-    } catch {
-      // si falla un fichero se sigue con el resto
+    } catch (error) {
+      failures.push(ruta);
     }
+  }
+
+  // Si algún fichero no se pudo restaurar, no se descartan sus pasos: si no,
+  // la UI decía «deshecho» y ya no había forma de reintentarlo.
+  if (failures.length > 0) {
+    return {
+      ok: false,
+      error: `No se pudieron restaurar ${failures.length} fichero(s).`,
+      restaurados,
+      failures,
+      mensaje: plan.mensaje,
+      pasosDeshacer: 0,
+    };
   }
 
   trayectoria.pasos = trayectoria.pasos.filter((paso) => !seleccionar(paso));

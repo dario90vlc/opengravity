@@ -141,7 +141,7 @@ export class OpenAIProvider implements ModelProvider {
     // Solo lo manda quien lo soporta: los servidores locales no lo aceptan.
     if (req.reasoningEffort) body.reasoning_effort = req.reasoningEffort;
 
-    const response = await fetchWithRetry(
+    let response = await fetchWithRetry(
       `${this.baseUrl}/chat/completions`,
       {
         method: 'POST',
@@ -152,6 +152,26 @@ export class OpenAIProvider implements ModelProvider {
       this.id,
       { signal, retries: 3 },
     );
+
+    /*
+     * Algunos endpoints OpenAI-compatible rechazan `stream_options` con 400.
+     * Se reintenta una vez sin él en vez de dejar inutilizable el proveedor.
+     */
+    if (response.status === 400 && 'stream_options' in body) {
+      await response.body?.cancel().catch(() => {});
+      delete body.stream_options;
+      response = await fetchWithRetry(
+        `${this.baseUrl}/chat/completions`,
+        {
+          method: 'POST',
+          headers: this.headers(),
+          body: JSON.stringify(body),
+          ...(signal ? { signal } : {}),
+        },
+        this.id,
+        { signal, retries: 3 },
+      );
+    }
     await ensureOk(response, this.id);
 
     if (!response.body) {
@@ -214,7 +234,7 @@ export class OpenAIProvider implements ModelProvider {
       yield { type: 'tool_call', call };
     }
 
-    if (pending.size > 0) finishReason = 'tool_calls';
+    if (pending.size > 0 && finishReason !== 'length') finishReason = 'tool_calls';
 
     yield { type: 'done', finishReason };
   }

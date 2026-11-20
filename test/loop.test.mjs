@@ -843,3 +843,32 @@ test('lo que se guarda en disco es lo del turno, aunque el historial se compacte
   assert.equal(resultado.appended[0].content, 'PROMPT-NUEVO-DEL-USUARIO');
   assert.ok(resultado.appended.length >= 2, 'el turno del asistente también se guarda');
 });
+test('las tools reciben sesión, turno y cwd del subagente', async () => {
+  let visto = null;
+  const tools = new ToolRegistry().registerAll([
+    {
+      name: 'captura',
+      description: 'captura',
+      parameters: { type: 'object', properties: {} },
+      async execute(_args, ctx) {
+        visto = ctx;
+        return { content: 'ok' };
+      },
+    },
+  ]);
+
+  await runAgent(
+    {
+      provider: proveedorFalso((n) => (n === 1 ? pideHerramienta('captura', {}) : responde('fin'))),
+      model: 'x',
+      tools,
+      maxSteps: 3,
+    },
+    'haz algo',
+    { cwd: '/workspace/sub', sessionId: 'sesion-1', turno: 7 },
+  );
+
+  assert.equal(visto.cwd, '/workspace/sub');
+  assert.equal(visto.sessionId, 'sesion-1');
+  assert.equal(visto.turno, 7);
+});

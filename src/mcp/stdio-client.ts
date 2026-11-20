@@ -164,22 +164,28 @@ export class StdioMcpClient implements McpClientLike {
       });
     });
 
-    const result = (await client.request('initialize', {
-      protocolVersion: MCP_PROTOCOL_VERSION,
-      capabilities: { tools: {} },
-      clientInfo: {
-        name: options.clientName ?? 'agent-ide',
-        version: options.clientVersion ?? '0.1.0',
-      },
-    })) as { serverInfo?: { name?: string; version?: string } } | undefined;
+    try {
+      const result = (await client.request('initialize', {
+        protocolVersion: MCP_PROTOCOL_VERSION,
+        capabilities: { tools: {} },
+        clientInfo: {
+          name: options.clientName ?? 'agent-ide',
+          version: options.clientVersion ?? '0.1.0',
+        },
+      })) as { serverInfo?: { name?: string; version?: string } } | undefined;
 
-    client.serverInfoValue = {
-      name: result?.serverInfo?.name ?? options.command,
-      version: result?.serverInfo?.version ?? 'desconocida',
-    };
+      client.serverInfoValue = {
+        name: result?.serverInfo?.name ?? options.command,
+        version: result?.serverInfo?.version ?? 'desconocida',
+      };
 
-    // Notificación obligatoria tras un initialize correcto.
-    client.notify('notifications/initialized', {});
+      // Notificación obligatoria tras un initialize correcto.
+      client.notify('notifications/initialized', {});
+    } catch (error) {
+      // Un handshake fallido no debe dejar el proceso hijo vivo.
+      await client.close().catch(() => {});
+      throw error;
+    }
 
     return client;
   }
@@ -405,25 +411,34 @@ export class StdioMcpClient implements McpClientLike {
       }, this.timeoutMs);
 
       this.pending.set(id, { resolve, reject, timer, method });
-      this.write({ jsonrpc: '2.0', id, method, params });
+      if (!this.write({ jsonrpc: '2.0', id, method, params })) {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        reject(new McpError(-32000, 'stdin del servidor MCP no disponible'));
+      }
     });
   }
 
-  private write(message: unknown): void {
+  /** Devuelve false en vez de lanzar: se llama desde handlers de stdout. */
+  private write(message: unknown): boolean {
     const stdin = this.child.stdin;
-    if (!stdin || stdin.destroyed) {
-      throw new McpError(-32000, 'stdin del servidor MCP no disponible');
-    }
+    if (!stdin || stdin.destroyed) return false;
     /*
      * Un servidor que muere mientras se le escribe emite EPIPE en stdin: sin
      * manejador, Node lo lanza como error no capturado y tumba el proceso
      * principal de Electron.
      */
-    stdin.on('error', () => {});
-    stdin.write(`${JSON.stringify(message)}\n`);
+    try {
+      stdin.write(`${JSON.stringify(message)}\n`);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private attach(): void {
+    // Un solo listener: añadirlo en cada write disparaba MaxListeners.
+    this.child.stdin?.on('error', () => {});
     const stdout = this.child.stdout;
     if (stdout) {
       stdout.setEncoding('utf8');

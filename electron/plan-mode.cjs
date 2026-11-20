@@ -231,6 +231,12 @@ class CicloDePlan {
     return handback({ informe: this.informe });
   }
 
+  /** El planner falló o no respondió: el ejecutor puede seguir con el plan actual. */
+  cancelarRevision() {
+    this.revisionPendiente = false;
+    this.fase = 'ejecutando';
+  }
+
   /** El planner entrega el plan y vuelve a ejecutarse. */
   entregarPlan(plan) {
     this.plan = plan;

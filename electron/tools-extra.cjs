@@ -3,6 +3,8 @@
 const { makeEditNotebookTool } = require('./notebook.cjs');
 const { dentroDelWorkspace, dentroDeRaices, sanearEntorno } = require('./hooks.cjs');
 const { argumentosGuardWin, argumentosHelperWin, limitesDeSandbox, obtenerHelperWin, prefijoPosix } = require('./sandbox.cjs');
+const { validarUrlPublica, descargarTexto } = require('./red-segura.cjs');
+const { configurarProxyNavegador, detenerProxyNavegador } = require('./browser-proxy.cjs');
 
 /**
  * Herramientas propias del proceso principal.
@@ -61,7 +63,7 @@ function coincideGlob(patron, ruta) {
  * Regla: primero gana la denegada (más específica o no), después la permitida.
  * Si no hay ninguna permitida configurada, todo lo que no esté denegado pasa.
  */
-function isUrlAllowed(url, rules) {
+function isUrlAllowed(url, rules, opciones = {}) {
   let parsed;
   try {
     parsed = new URL(url);
@@ -83,6 +85,26 @@ function isUrlAllowed(url, rules) {
 
   if (matches(deny)) {
     return { allowed: false, reason: `${host} está en la lista de denegadas` };
+  }
+
+  /*
+   * Sin esto, `fetch_url('http://169.254.169.254/...')` o localhost podía
+   * alcanzar servicios locales. Si el usuario lo permite explícitamente en
+   * `allow`, se respeta.
+   */
+  const loopback = host === 'localhost' || host === '::1' || host === '[::1]' || /^127\./.test(host);
+  const privada =
+    /^10\./.test(host) ||
+    /^192\.168\./.test(host) ||
+    /^169\.254\./.test(host) ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(host) ||
+    /^(fc|fd)[0-9a-f]{2}:/i.test(host) ||
+    /^fe80:/i.test(host);
+  if ((loopback || privada) && !opciones.allowLocal && !matches(allow)) {
+    return {
+      allowed: false,
+      reason: `${host} es una dirección local o privada; añádela a la lista de permitidas para acceder`,
+    };
   }
 
   if (allow.length > 0 && !matches(allow)) {
@@ -116,25 +138,22 @@ function makeFetchUrlTool(getPrefs) {
         return { content: `Acceso denegado: ${verdict.reason}`, isError: true };
       }
 
-      const maxBytes = Number(args.maxBytes ?? 200_000);
-
-      try {
-        const response = await fetch(url, {
-          headers: { 'user-agent': 'agent-ide/0.1' },
-          signal: AbortSignal.timeout(20_000),
-        });
-
-        if (!response.ok) {
-          return { content: `HTTP ${response.status} al pedir ${url}`, isError: true };
-        }
-
-        const text = await response.text();
-        const body = text.length > maxBytes ? `${text.slice(0, maxBytes)}\n[truncado]` : text;
-        return { content: body };
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        return { content: `Fallo al descargar ${url}: ${message}`, isError: true };
+      const maxBytesRaw = Number(args.maxBytes ?? 200_000);
+      if (!Number.isFinite(maxBytesRaw) || maxBytesRaw <= 0) {
+        return { content: '`maxBytes` debe ser un número positivo.', isError: true };
       }
+      const maxBytes = Math.floor(maxBytesRaw);
+      const descarga = await descargarTexto(url, {
+        headers: { 'user-agent': 'agent-ide/0.1' },
+        maxBytes,
+      });
+      if (!descarga.ok) {
+        return { content: `Acceso denegado: ${descarga.error}`, isError: true };
+      }
+      if (descarga.status < 200 || descarga.status >= 300) {
+        return { content: `HTTP ${descarga.status} al pedir ${url}`, isError: true };
+      }
+      return { content: descarga.texto || '(sin contenido)' };
     },
   };
 }
@@ -162,8 +181,13 @@ function makeOpenUrlTool(getPrefs) {
         return { content: `Acceso denegado: ${verdict.reason}`, isError: true };
       }
 
+      const publica = await validarUrlPublica(url);
+      if (!publica.ok) {
+        return { content: `Acceso denegado: ${publica.error}`, isError: true };
+      }
+
       if (prefs.openLinksIn === 'Built-in Browser') {
-        openBuiltInBrowser(url);
+        await openBuiltInBrowser(url);
         return { content: `Abierta ${url} en el navegador integrado.` };
       }
 
@@ -173,8 +197,12 @@ function makeOpenUrlTool(getPrefs) {
   };
 }
 
-/** Ventana reutilizable del navegador integrado. */
+/** Ventana reutilizable del navegador del agente (sin sesión de Google). */
 let builtInBrowser = null;
+/** Ventana separada para Flow; conserva su propia sesión de Google. */
+let builtInFlowBrowser = null;
+const PARTICION_AGENTE = 'persist:opengravity-agent-browser';
+const PARTICION_FLOW = 'persist:opengravity-flow';
 
 /**
  * Abre el navegador integrado.
@@ -183,19 +211,20 @@ let builtInBrowser = null;
  * por detrás, sin que el usuario vea nada. El navegador sigue existiendo y
  * ejecutando JS con normalidad.
  */
-function openBuiltInBrowser(url, opciones = {}) {
+async function openBuiltInBrowser(url, opciones = {}) {
   const oculto = opciones.oculto === true;
+  const flow = opciones.flow === true;
+  const actual = flow ? builtInFlowBrowser : builtInBrowser;
 
-  if (builtInBrowser && !builtInBrowser.isDestroyed()) {
-    if (!oculto && !builtInBrowser.isVisible()) {
-      builtInBrowser.show();
-    }
-    builtInBrowser.loadURL(url);
-    if (!oculto) builtInBrowser.focus();
-    return waitForLoad(builtInBrowser);
+  if (actual && !actual.isDestroyed()) {
+    if (!flow) await configurarProxyNavegador(actual.webContents.session);
+    if (!oculto && !actual.isVisible()) actual.show();
+    actual.loadURL(url);
+    if (!oculto) actual.focus();
+    return waitForLoad(actual);
   }
 
-  builtInBrowser = new BrowserWindow({
+  const ventana = new BrowserWindow({
     width: 1100,
     height: 800,
     show: !oculto,
@@ -205,11 +234,11 @@ function openBuiltInBrowser(url, opciones = {}) {
       contextIsolation: true,
       nodeIntegration: false,
       /*
-       * Partición propia y persistente: la sesión de Google que el usuario
-       * inicie aquí se conserva entre arranques, y es la misma que usa
-       * `generate_image` para hablar con Flow.
+       * El navegador del agente no comparte cookies con la sesión Google del
+       * usuario. Flow tiene una partición propia, separada también del panel
+       * de navegación normal.
        */
-      partition: 'persist:opengravity-browser',
+      partition: flow ? PARTICION_FLOW : PARTICION_AGENTE,
       /*
        * Sin esto, Chromium frena las ventanas invisibles: React no pinta y el
        * DOM aparece vacío, así que no se encuentran ni botones ni cajas.
@@ -218,12 +247,16 @@ function openBuiltInBrowser(url, opciones = {}) {
     },
   });
 
-  builtInBrowser.loadURL(url);
-  builtInBrowser.on('closed', () => {
-    builtInBrowser = null;
+  if (!flow) await configurarProxyNavegador(ventana.webContents.session);
+  ventana.loadURL(url);
+  ventana.on('closed', () => {
+    if (flow) builtInFlowBrowser = null;
+    else builtInBrowser = null;
   });
+  if (flow) builtInFlowBrowser = ventana;
+  else builtInBrowser = ventana;
 
-  return waitForLoad(builtInBrowser);
+  return waitForLoad(ventana);
 }
 
 /** Espera a que la ventana termine de cargar (máximo 20 s). */
@@ -330,6 +363,10 @@ function makeBrowserTools(getPrefs, askUser) {
         const verdict = isUrlAllowed(url, getPrefs().networkRules);
         if (!verdict.allowed) {
           return { content: `Acceso denegado: ${verdict.reason}`, isError: true };
+        }
+        const publica = await validarUrlPublica(url);
+        if (!publica.ok) {
+          return { content: `Acceso denegado: ${publica.error}`, isError: true };
         }
 
         const loaded = await openBuiltInBrowser(url);
@@ -451,6 +488,10 @@ ${clipped || '(sin texto visible)'}` };
         const verdict = isUrlAllowed(url, getPrefs().networkRules);
         if (!verdict.allowed) {
           return { content: `Acceso denegado: ${verdict.reason}`, isError: true };
+        }
+        const publica = await validarUrlPublica(url);
+        if (!publica.ok) {
+          return { content: `Acceso denegado: ${publica.error}`, isError: true };
         }
 
         if (!builtInBrowser || builtInBrowser.isDestroyed()) {
@@ -897,11 +938,14 @@ ${clipped || '(sin texto visible)'}` };
         required: ['steps'],
       },
       async execute(args) {
-        const missing = requirePage();
-        if (missing) return { content: missing, isError: true };
-
         const pasos = Array.isArray(args.steps) ? args.steps.slice(0, 30) : [];
         if (pasos.length === 0) return { content: 'Faltan pasos.', isError: true };
+        // `open` es precisamente el paso que crea la página; exigir una antes
+        // hacía imposible el caso más normal.
+        if (String(pasos[0]?.action ?? '') !== 'open') {
+          const missing = requirePage();
+          if (missing) return { content: missing, isError: true };
+        }
 
         const resultados = [];
         for (let i = 0; i < pasos.length; i += 1) {
@@ -1299,9 +1343,11 @@ function makeEditFileTool(getCwd) {
         };
       }
 
+      // Reemplazo literal: `String.replace` con string interpreta `$&`, `$1`…
+      // y corrompía el fichero cuando el texto nuevo los contenía.
       const siguiente = allowMultiple
         ? current.split(effectiveOld).join(effectiveNew)
-        : current.replace(effectiveOld, effectiveNew);
+        : current.replace(effectiveOld, () => effectiveNew);
       await fsp.writeFile(absolute, siguiente, 'utf8');
       return {
         content: `Editado ${relative}${occurrences > 1 ? ` (${occurrences} apariciones)` : ''}.`,
@@ -1362,9 +1408,16 @@ function makeGenerateImageTool(getCwd) {
        * Se abre OCULTO: el usuario no ve ninguna ventana. El navegador existe,
        * ejecuta JS y mantiene la sesión, pero no se muestra.
        */
-      if (!builtInBrowser || builtInBrowser.isDestroyed()) {
-        openBuiltInBrowser(URL_FLOW, { oculto: true });
+      let navegadorFlow = typeof navegadorIntegrado === 'function'
+        ? navegadorIntegrado(true)
+        : builtInFlowBrowser;
+      if (!navegadorFlow || navegadorFlow.isDestroyed()) {
+        openBuiltInBrowser(URL_FLOW, { oculto: true, flow: true });
         await new Promise((r) => setTimeout(r, 6000));
+        navegadorFlow = navegadorIntegrado(true);
+      }
+      if (!navegadorFlow) {
+        return { content: 'No se pudo abrir el navegador de Flow.', isError: true };
       }
 
       /*
@@ -1381,7 +1434,7 @@ function makeGenerateImageTool(getCwd) {
             `flow-${new Date().toISOString().replace(/[:.]/g, '-')}`,
           );
 
-      const resultado = await generarEnFlow(builtInBrowser, {
+      const resultado = await generarEnFlow(navegadorFlow, {
         prompt,
         destino,
         aspectRatio: args?.aspectRatio,
@@ -1392,6 +1445,12 @@ function makeGenerateImageTool(getCwd) {
           content:
             `${resultado.error}\n\n` +
             'Puedes abrir Flow a mano con `browser_open` en ' + URL_FLOW + ' para revisar su estado.',
+          isError: true,
+        };
+      }
+      if (resultado.error) {
+        return {
+          content: `Imagen generada pero no se pudo guardar: ${resultado.error}`,
           isError: true,
         };
       }
@@ -1772,6 +1831,8 @@ function makeRunCommandTool(getCwd, getPrefs) {
         nombre: taskName,
         comando: command,
         cwd,
+        sessionId: ctx?.sessionId ?? null,
+        turno: ctx?.turno ?? null,
         stdout: '',
         stderr: '',
         done: false,
@@ -1890,6 +1951,9 @@ function makeRunCommandTool(getCwd, getPrefs) {
       child.stderr.on('data', (chunk) => {
         if (tarea.stderr.length < MAX_SALIDA) tarea.stderr += chunk.toString();
       });
+      // El error de stdin es asíncrono (EPIPE al morir el hijo); sin listener
+      // se convierte en un uncaughtException y tumba Electron.
+      child.stdin.on('error', () => {});
       child.on('error', (error) => {
         tarea.done = true;
         tarea.exitCode = -1;
@@ -2055,6 +2119,9 @@ function makeManageTaskTool() {
         if (typeof args.input !== 'string') {
           return { content: 'send_input necesita input.', isError: true };
         }
+        if (tarea.done || !tarea.child?.stdin || tarea.child.stdin.destroyed) {
+          return { content: `La tarea ${tarea.id} ya terminó; no admite stdin.`, isError: true };
+        }
         try {
           tarea.child.stdin.write(args.input);
           return { content: `Enviado a ${tarea.id}.` };
@@ -2112,7 +2179,7 @@ function makeSearchWebTool(getPrefs) {
       }
 
       try {
-        const respuesta = await fetch(url, {
+        const respuesta = await descargarTexto(url, {
           method: 'POST',
           headers: {
             'user-agent':
@@ -2120,14 +2187,18 @@ function makeSearchWebTool(getPrefs) {
             'content-type': 'application/x-www-form-urlencoded',
           },
           body: new URLSearchParams({ q: busqueda, kl: 'wt-wt' }).toString(),
-          signal: AbortSignal.timeout(20_000),
+          maxBytes: 2_000_000,
+          timeoutMs: 20_000,
         });
 
         if (!respuesta.ok) {
+          return { content: `Acceso denegado: ${respuesta.error}`, isError: true };
+        }
+        if (respuesta.status < 200 || respuesta.status >= 300) {
           return { content: `La búsqueda falló con estado ${respuesta.status}.`, isError: true };
         }
 
-        const html = await respuesta.text();
+        const html = respuesta.texto;
         const resultados = parsearDuckDuckGo(html, maximo);
 
         if (resultados.length === 0) {
@@ -2543,8 +2614,9 @@ function makeRunWorkflowTool(getCwd, ejecutarComando) {
  * La necesita `generate_image` cuando se le llama fuera del agente (por IPC),
  * donde no hay una referencia local a la ventana.
  */
-function navegadorIntegrado() {
-  return builtInBrowser && !builtInBrowser.isDestroyed() ? builtInBrowser : null;
+function navegadorIntegrado(flow = false) {
+  const ventana = flow ? builtInFlowBrowser : builtInBrowser;
+  return ventana && !ventana.isDestroyed() ? ventana : null;
 }
 
 module.exports = {
@@ -2573,4 +2645,5 @@ module.exports = {
   makeOpenUrlTool,
   openBuiltInBrowser,
   browserEvaluate,
+  detenerProxyNavegador,
 };

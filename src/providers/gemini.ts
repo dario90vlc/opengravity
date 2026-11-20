@@ -164,6 +164,9 @@ export class GeminiProvider implements ModelProvider {
 
     let sawToolCall = false;
     let finishReason: FinishReason = 'stop';
+    // Gemini 3 puede adjuntar la firma a la parte de pensamiento/texto previa,
+    // no solo al functionCall; se arrastra hasta la llamada.
+    let firmaPendiente = '';
     let inputTokens = 0;
     let outputTokens = 0;
 
@@ -187,6 +190,9 @@ export class GeminiProvider implements ModelProvider {
 
       for (const candidate of event.candidates ?? []) {
         for (const part of candidate.content?.parts ?? []) {
+          if (typeof part.thoughtSignature === 'string' && part.thoughtSignature.length > 0) {
+            firmaPendiente = part.thoughtSignature;
+          }
           const trozo = textoDeDelta(part.text);
           if (trozo.length > 0) {
             // Los fragmentos de pensamiento no son respuesta visible.
@@ -200,8 +206,8 @@ export class GeminiProvider implements ModelProvider {
               id: `call_${crypto.randomUUID()}`,
               name: part.functionCall.name,
               arguments: coerceArguments(part.functionCall.args),
-              ...(part.thoughtSignature
-                ? { providerMeta: { thoughtSignature: part.thoughtSignature } }
+              ...(firmaPendiente || part.thoughtSignature
+                ? { providerMeta: { thoughtSignature: firmaPendiente || part.thoughtSignature } }
                 : {}),
             };
             yield { type: 'tool_call', call };
@@ -223,7 +229,7 @@ export class GeminiProvider implements ModelProvider {
       yield { type: 'usage', inputTokens, outputTokens };
     }
 
-    yield { type: 'done', finishReason: sawToolCall ? 'tool_calls' : finishReason };
+    yield { type: 'done', finishReason: sawToolCall && finishReason === 'stop' ? 'tool_calls' : finishReason };
   }
 }
 

@@ -331,6 +331,8 @@ export async function runAgent(
         razonamiento = '';
         toolCalls.length = 0;
         thinkingBlocks.length = 0;
+        turnInput = 0;
+        turnOutput = 0;
         options.onEvent?.({ type: 'stream_reset' });
         options.onEvent?.({ type: 'step', index: steps });
         await new Promise<void>((resolve) => setTimeout(resolve, 400));
@@ -359,6 +361,16 @@ export async function runAgent(
       options.onEvent?.({ type: 'usage', inputTokens: totalInput, outputTokens: totalOutput });
       options.onEvent?.({ type: 'done', reason: 'stop', steps, text: aviso });
       return { text: aviso, messages, appended, steps, reason: 'stop' };
+    }
+
+    if (turn.finishReason === 'error') {
+      const aviso = text.trim().length > 0
+        ? text
+        : 'El proveedor cortó la respuesta antes de terminar (filtro de seguridad o error del modelo).';
+      add({ role: 'assistant', content: aviso });
+      options.onEvent?.({ type: 'usage', inputTokens: totalInput, outputTokens: totalOutput });
+      options.onEvent?.({ type: 'done', reason: 'error', steps, text: aviso });
+      return { text: aviso, messages, appended, steps, reason: 'error' };
     }
 
     // Sin herramientas: el agente ha terminado su respuesta.
@@ -390,9 +402,35 @@ export async function runAgent(
      * llamada del lote, así que una imagen que no fuese la primera se cortaba a
      * los 120 s.
      */
-    const TIMEOUTS_LARGOS: Record<string, number> = { generate_image: 240_000 };
+    /*
+     * Las herramientas interactivas esperan al usuario (plan, preguntas, diff,
+     * permiso). Sus propias tarjetas caducan a los 10 minutos; el timeout de la
+     * herramienta debe ser mayor, o el turno se corta mientras la tarjeta sigue
+     * abierta. Antes eran 120 s y ese desajuste perdía la respuesta del usuario.
+     */
+    const TIMEOUT_LARGO_MS = 11 * 60_000;
+    const TIMEOUTS_LARGOS: Record<string, number> = {
+      generate_image: 240_000,
+      present_plan: TIMEOUT_LARGO_MS,
+      ask_question: TIMEOUT_LARGO_MS,
+      ask_user_question: TIMEOUT_LARGO_MS,
+      enter_plan_mode: TIMEOUT_LARGO_MS,
+      write_file: TIMEOUT_LARGO_MS,
+      edit_file: TIMEOUT_LARGO_MS,
+      multi_replace: TIMEOUT_LARGO_MS,
+      edit_notebook: TIMEOUT_LARGO_MS,
+      run_command: TIMEOUT_LARGO_MS,
+      run_workflow: TIMEOUT_LARGO_MS,
+      run_extension_code: TIMEOUT_LARGO_MS,
+      browser_task: TIMEOUT_LARGO_MS,
+    };
 
     const runOne = async (call: ToolCall) => {
+      // Una cancelación no debe ejecutar ni la compuerta ni la herramienta.
+      if (ctx.signal?.aborted) {
+        return { call, content: 'Cancelado por el usuario.', isError: true };
+      }
+
       // Compuerta: si la política la rechaza, no llega a ejecutarse.
       const rechazo = options.toolGate?.(call, { paso: steps });
       if (rechazo) {
@@ -402,14 +440,34 @@ export async function runAgent(
       const toolTimeout =
         TIMEOUTS_LARGOS[call.name] ?? options.toolTimeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS;
 
-      // Una herramienta colgada no puede bloquear el turno: se corta por tiempo.
+      /*
+       * El timeout debe abortar también la herramienta, no solo dejar de
+       * esperar: si no, un comando o una escritura sigue viva después de que el
+       * turno la haya dado por colgada. El controlador se encadena al signal
+       * del turno para que Stop llegue igualmente.
+       */
+      const toolController = new AbortController();
+      const abortar = () => toolController.abort();
+      ctx.signal?.addEventListener('abort', abortar, { once: true });
+      if (ctx.signal?.aborted) toolController.abort();
+
+      let timeoutId: NodeJS.Timeout | undefined;
       const timeout = new Promise<never>((_, reject) => {
-        const id = setTimeout(
-          () => reject(new Error(`la herramienta ${call.name} superó ${Math.round(toolTimeout / 1000)}s`)),
-          toolTimeout,
-        );
-        // No mantiene vivo el proceso si el turno termina antes.
-        (id as unknown as { unref?: () => void }).unref?.();
+        timeoutId = setTimeout(() => {
+          toolController.abort();
+          reject(new Error(`la herramienta ${call.name} superó ${Math.round(toolTimeout / 1000)}s`));
+        }, toolTimeout);
+        timeoutId.unref?.();
+      });
+
+      // Si la tool ignora la señal, esta carrera libera el turno igualmente.
+      let quitarCancelacion = () => {};
+      const cancelacion = new Promise<never>((_, reject) => {
+        if (!ctx.signal) return;
+        const alCancelar = () => reject(new Error('cancelado por el usuario'));
+        ctx.signal.addEventListener('abort', alCancelar, { once: true });
+        if (ctx.signal.aborted) alCancelar();
+        quitarCancelacion = () => ctx.signal?.removeEventListener('abort', alCancelar);
       });
 
       let result;
@@ -418,14 +476,24 @@ export async function runAgent(
           options.tools.execute(call.name, call.arguments, {
             cwd: ctx.cwd,
             callId: call.id,
-            ...(ctx.signal ? { signal: ctx.signal } : {}),
+            signal: toolController.signal,
+            ...(ctx.sessionId !== undefined ? { sessionId: ctx.sessionId } : {}),
+            ...(ctx.turno !== undefined ? { turno: ctx.turno } : {}),
             ...(ctx.log ? { log: ctx.log } : {}),
           }),
           timeout,
+          cancelacion,
         ]);
       } catch (error) {
+        if (ctx.signal?.aborted) {
+          return { call, content: 'Cancelado por el usuario.', isError: true };
+        }
         const message = error instanceof Error ? error.message : String(error);
         return { call, content: `Fallo en ${call.name}: ${message}`, isError: true };
+      } finally {
+        if (timeoutId) clearTimeout(timeoutId);
+        quitarCancelacion();
+        ctx.signal?.removeEventListener('abort', abortar);
       }
 
       return {
@@ -599,11 +667,13 @@ const TOOLS_CON_PROGRESO: Record<string, true> = {
 const SERIAL_TOOLS: Record<string, true> = {
   run_command: true,
   run_workflow: true,
+  run_tests: true,
   write_file: true,
   edit_file: true,
   multi_replace: true,
   edit_notebook: true,
   present_plan: true,
+  enter_plan_mode: true,
   generate_image: true,
   browser_task: true,
 };
@@ -816,9 +886,18 @@ async function compactHistory(
       const text = m.content.replace(/\s+/g, ' ').slice(0, 1200);
       return `${m.role}: ${text}`;
     })
-    .join('\n');
+    .join('\n')
+    // El propio resumen no puede ser más grande que el presupuesto que intenta
+    // aliviar; antes se enviaba un transcript completo y el proveedor lo rechazaba.
+    .slice(0, Math.max(4_000, Math.floor(budget * 0.6)));
 
   let summary = '';
+  const controlador = new AbortController();
+  const temporizador = setTimeout(() => controlador.abort(), 20_000);
+  temporizador.unref?.();
+  const abortarExterno = () => controlador.abort();
+  signal?.addEventListener('abort', abortarExterno, { once: true });
+  if (signal?.aborted) controlador.abort();
 
   try {
     for await (const chunk of provider.streamGenerate(
@@ -831,12 +910,15 @@ async function compactHistory(
         messages: [{ role: 'user', content: transcript }],
         maxTokens: Math.min(1200, Math.floor(budget / 8)),
       },
-      signal,
+      controlador.signal,
     )) {
       if (chunk.type === 'text') summary += chunk.text;
     }
   } catch {
     return null;
+  } finally {
+    clearTimeout(temporizador);
+    signal?.removeEventListener('abort', abortarExterno);
   }
 
   const limpio = summary.trim();
@@ -919,6 +1001,24 @@ function fitContext(messages: Message[], budget: number): Message[] {
     }
 
     if (message.role !== 'tool' && message.role !== 'assistant') continue;
+
+    /*
+     * Los argumentos de un `write_file`/`multi_replace` viejo también pesan en
+     * la petición. Antes `fitContext` solo recortaba `content`, así que un
+     * historial con tool_calls grandes seguía por encima de la ventana y el
+     * proveedor devolvía 400.
+     */
+    if (message.role === 'assistant' && message.toolCalls && message.toolCalls.length > 0) {
+      const antes = pesoDeMensaje(message);
+      message.toolCalls = message.toolCalls.map((call) => {
+        const crudo = JSON.stringify(call.arguments ?? {});
+        return crudo.length > 400
+          ? { ...call, arguments: { _truncado: 'argumentos recortados por contexto' } }
+          : call;
+      });
+      used -= antes - pesoDeMensaje(message);
+    }
+
     if (message.content.length <= 300) continue;
 
     const keep = 300;

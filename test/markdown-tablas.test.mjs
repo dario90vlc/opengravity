@@ -48,3 +48,14 @@ test('tablas sin pipes en los extremos (como en respuestas LLM GFM) renderizan t
   // Ninguna fila debe haber caído fuera de la tabla en un <p>
   assert.doesNotMatch(html, /<p class="md-p">VOZ LOCAL/);
 });
+
+test('los enlaces file:// del agente se conservan para abrir el editor', () => {
+  const html = Markdown.render('[src/app.ts](file:///C:/proyecto/src/app.ts#L10-L20)');
+  assert.match(html, /href="file:\/\/\/C:\/proyecto\/src\/app\.ts#L10-L20"/);
+  assert.match(html, />src\/app\.ts<\/a>/);
+});
+
+test('un esquema no permitido no se convierte en enlace ejecutable', () => {
+  const html = Markdown.render('[pulsa](javascript:alert(1))');
+  assert.doesNotMatch(html, /href="javascript:/i);
+});

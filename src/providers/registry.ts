@@ -115,7 +115,8 @@ export function soportaPensamiento(
      * aceptan 3.7–4.6. Claude 4.7+ y 5.x solo admiten `adaptive` y rechazan
      * `enabled` con 400, así que ahí el botón no se ofrece.
      */
-    const version = id.match(/claude-(?:[a-z]+-)?(\d+)(?:[.-](\d+))?/);
+    // La fecha del id (`claude-sonnet-4-20250514`) no es la versión menor.
+    const version = id.match(/claude-(?:[a-z]+-)?(\d+)(?:[.-](\d{1,2}))?(?=$|-)/);
     if (!version) return false;
     const mayor = Number(version[1]);
     const menor = Number(version[2] ?? 0);

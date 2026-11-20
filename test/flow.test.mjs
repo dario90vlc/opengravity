@@ -48,6 +48,24 @@ function ventanaFalsa({ url = 'https://flow.google.com/', respuestas = {}, naveg
         if (script.includes('texto-en-editor')) {
           return { ok: aceptaTexto, leidos: [textoEditor] };
         }
+        // El selector de modo es obligatorio antes de generar.
+        if (script.includes('Activador de ajustes')) return respuestas.ajustes ?? { ok: true };
+        if (script.includes('imagen.click')) {
+          return respuestas.modo ?? { ok: true, etiqueta: 'Imagen', marcadoAntes: true };
+        }
+        if (script.includes('activos.some')) {
+          return respuestas.modoConfirmado ?? {
+            ok: true,
+            enImagen: true,
+            modelo: 'Nano Banana',
+          };
+        }
+        if (script.includes('sin selector de modelo')) {
+          return respuestas.selectorModelo ?? { ok: true, actual: 'Nano Banana' };
+        }
+        if (script.includes('modelos: items.map')) {
+          return respuestas.modeloFinal ?? { ok: true, modelo: 'Nano Banana' };
+        }
         if (script.includes('yaHayEditor')) return respuestas.editor ?? { ok: true, yaDentro: true };
         if (script.includes('sin-caja')) return respuestas.escribir ?? { ok: true };
         if (script.includes('sin boton de generar')) return respuestas.pulsar ?? { ok: true, x: 100, y: 200 };

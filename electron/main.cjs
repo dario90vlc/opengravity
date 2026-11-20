@@ -19,6 +19,7 @@ const { app, BrowserWindow, ipcMain, dialog, shell, Menu, protocol, net, safeSto
 const path = require('node:path');
 const { fileURLToPath } = require('node:url');
 const os = require('node:os');
+const { isUtf8 } = require('node:buffer');
 const fsp = require('node:fs/promises');
 const http = require('node:http');
 const {
@@ -58,7 +59,8 @@ const {
 } = require('./hooks.cjs');
 const trayectoria = require('./trajectory.cjs');
 const { restoreSnapshots } = require('./checkpoints.cjs');
-const { registrarRaiz, rutaAutorizada } = require('./rutas.cjs');
+const { registrarRaiz, rutaAutorizada, olvidarRaices } = require('./rutas.cjs');
+const { validarUrlPublica } = require('./red-segura.cjs');
 const { SKILL_CATALOG, buildPromptExtras } = require('./prompt-extras.cjs');
 
 const { correrEnParalelo } = require('./subagent-merge.cjs');
@@ -298,6 +300,13 @@ const state = {
   prefs: {},
 };
 
+// Mientras se carga una sesión no se puede enviar ni empezar otra carga: el
+// estado global cambiaría bajo el turno en preparación.
+let cargandoSesion = false;
+// Un revert restaura ficheros y reescribe la sesión en varios awaits; mientras
+// dura no se puede cargar/crear otra conversación ni enviar un turno.
+let revirtiendo = false;
+
 /** Descargas del navegador integrado, de la más reciente a la más antigua. */
 const descargas = [];
 let contadorDescargas = 0;
@@ -342,9 +351,6 @@ app.whenReady().then(() => {
   try {
     trayectoria.configurar(path.join(app.getPath('userData'), 'trajectory'));
     subagentes.configurar(path.join(app.getPath('userData'), 'subagents.json'));
-    // Poda de trayectorias viejas al arrancar: no crecen sin límite.
-    const dias = Number(state.prefs.trajectoryRetentionDays ?? 30);
-    trayectoria.podarAntiguas(dias).catch(() => {});
   } catch {
     // sin persistencia se sigue funcionando en memoria
   }
@@ -892,11 +898,28 @@ function guardTool(tool, preset, prefs, getWindow) {
   const esComando = () =>
     tool.name === 'run_command' ||
     tool.name === 'run_workflow' ||
-    tool.name === 'run_extension_code';
+    tool.name === 'run_extension_code' ||
+    tool.name === 'run_tests' ||
+    tool.name === 'generate_image';
+
+  // Programar es una mutación persistente: aunque no escriba en el workspace,
+  // debe pasar por la puerta de permisos.
+  const esProgramacion = tool.name === 'notify_user' || tool.name === 'schedule';
 
   return {
     ...tool,
     async execute(args, ctx) {
+      /*
+       * Un subagente de una conversación anterior no puede seguir tocando el
+       * workspace de la conversación abierta. Sus escrituras ya no tienen un
+       * turno activo donde pedir aprobación ni dónde registrar el undo.
+       */
+      if (ctx?.sessionId && state.sessionId && ctx.sessionId !== state.sessionId) {
+        return {
+          content: 'La conversación cambió antes de completar la herramienta; se canceló.',
+          isError: true,
+        };
+      }
       const writes = esMutacion(args);
       /*
        * «Pedir revisión» es para acciones que cambian algo: escrituras,
@@ -904,8 +927,15 @@ function guardTool(tool, preset, prefs, getWindow) {
        * abrir un fichero costaba un diálogo nativo.
        */
       const presetAsks =
-        (preset === 'Request Review' || preset === 'Default') && (writes || esComando());
-      const needsAsk = explicit === 'ask' || (explicit === 'inherit' && presetAsks);
+        (preset === 'Request Review' || preset === 'Default') &&
+        (writes || esComando() || esProgramacion);
+      const needsAsk =
+        explicit === 'ask' ||
+        (explicit === 'inherit' &&
+          (presetAsks ||
+            // Una tool MCP es opaca: no sabemos si lee, escribe o ejecuta.
+            (tool.mcp === true &&
+              (preset === 'Request Review' || preset === 'Default'))));
 
       if (!needsAsk && !writes) {
         return tool.name === 'run_command'
@@ -972,10 +1002,10 @@ async function registrarSnapshotDeEscritura(args, ctx) {
   const absoluta = path.resolve(ctx.cwd, relativa);
   try {
     const antes = await fsp.readFile(absoluta, 'utf8');
-    recordCheckpoint(absoluta, antes, ctx.callId);
+    recordCheckpoint(absoluta, antes, ctx.callId, ctx.sessionId, ctx.turno);
   } catch {
     // El fichero no existe todavía: se marca como nuevo.
-    recordCheckpoint(absoluta, null, ctx.callId);
+    recordCheckpoint(absoluta, null, ctx.callId, ctx.sessionId, ctx.turno);
   }
 }
 
@@ -995,12 +1025,30 @@ async function executeWriteWithDiff(tool, args, ctx, win, needsAsk) {
   // Para edit_file el resultado se calcula aplicando el reemplazo.
   let proposed;
   if (tool.name === 'edit_file') {
-    const oldText = String(args.oldText ?? '');
-    const newText = String(args.newText ?? '');
-    if (oldText.length === 0 || !before.includes(oldText)) {
-      return { content: `oldText no aparece en ${relative}.`, isError: true };
+    if (Array.isArray(args.edits) && args.edits.length > 0) {
+      const { aplicarReemplazos } = require('./multi-replace.cjs');
+      const resultado = aplicarReemplazos(before, args.edits);
+      if (resultado.error) {
+        return { content: `${resultado.error} No se cambió nada.`, isError: true };
+      }
+      proposed = resultado.texto;
+    } else {
+      let oldText = String(args.oldText ?? '');
+      let newText = String(args.newText ?? '');
+      // Misma normalización CRLF que la herramienta real; si no, la tarjeta
+      // rechazaba un cambio que edit_file sí sabía aplicar.
+      if (!before.includes(oldText) && before.includes('\r\n') && !oldText.includes('\r\n')) {
+        oldText = oldText.replace(/\n/g, '\r\n');
+        newText = newText.replace(/\n/g, '\r\n');
+      } else if (!before.includes(oldText) && !before.includes('\r\n') && oldText.includes('\r\n')) {
+        oldText = oldText.replace(/\r\n/g, '\n');
+        newText = newText.replace(/\r\n/g, '\n');
+      }
+      if (oldText.length === 0 || !before.includes(oldText)) {
+        return { content: `oldText no aparece en ${relative}.`, isError: true };
+      }
+      proposed = before.replace(oldText, () => newText);
     }
-    proposed = before.replace(oldText, newText);
   } else if (tool.name === 'multi_replace') {
     /*
      * Antes se usaba `args.content`, que multi_replace no tiene: la tarjeta
@@ -1017,7 +1065,7 @@ async function executeWriteWithDiff(tool, args, ctx, win, needsAsk) {
     proposed = String(args.content ?? '');
   }
 
-  recordCheckpoint(absolute, isNew ? null : before, ctx.callId);
+  recordCheckpoint(absolute, isNew ? null : before, ctx.callId, ctx.sessionId, ctx.turno);
 
   const { rows, additions, removals, approximate } = diffLines(before, proposed);
   const payload = {
@@ -1055,7 +1103,6 @@ const codeIndex = new CodeIndex({ root: process.cwd() });
 
 /** Construye (o refresca) el índice. */
 ipcMain.handle('index:build', async () => {
-  codeIndex.root = state.cwd;
   const stats = await codeIndex.build(state.cwd);
   return { ok: true, ...stats };
 });
@@ -1068,7 +1115,6 @@ function scheduleIndexRefresh() {
   indexRefreshTimer = setTimeout(async () => {
     indexRefreshTimer = null;
     try {
-      codeIndex.root = state.cwd;
       await codeIndex.build(state.cwd);
     } catch {
       // el refresco es best-effort
@@ -1094,7 +1140,9 @@ ipcMain.handle('index:warm', async () => {
    * comprobación, un prefs:set cambiaba el destino de los embeddings y con él
    * se iban el código del workspace y la clave del proveedor.
    */
-  const veredicto = isUrlAllowed(String(config.url), state.prefs.networkRules);
+  const veredicto = isUrlAllowed(String(config.url), state.prefs.networkRules, {
+    allowLocal: config.provider === 'ollama',
+  });
   if (!veredicto.allowed) {
     return { ok: false, error: `URL de embeddings rechazada: ${veredicto.reason}` };
   }
@@ -1139,7 +1187,19 @@ ipcMain.handle('index:search', async (_event, payload) => {
   }
 
   // Híbrido: reordena combinando BM25 con similitud semántica.
-  const reranked = await codeIndex.rerankWithEmbeddings(query, results, embeddingConfig());
+  const config = embeddingConfig();
+  const veredicto = isUrlAllowed(String(config.url), state.prefs.networkRules, {
+    allowLocal: config.provider === 'ollama',
+  });
+  if (!veredicto.allowed) {
+    return {
+      ok: true,
+      mode: 'lexical',
+      results,
+      warning: `reordenamiento semántico omitido: ${veredicto.reason}`,
+    };
+  }
+  const reranked = await codeIndex.rerankWithEmbeddings(query, results, config);
 
   return { ok: true, mode: 'hybrid', results: reranked };
 });
@@ -1154,6 +1214,8 @@ const fsSync = require('node:fs');
 
 /** Clientes LSP por lenguaje. */
 const lspClients = new Map();
+// Arranques en curso: dos pestañas pueden pedir el mismo servidor a la vez.
+const lspStarts = new Map();
 
 /** Resuelve el servidor de TypeScript incluido en el proyecto. */
 function bundledTsServer() {
@@ -1219,43 +1281,54 @@ async function ensureLspClient(filePath) {
   const existing = lspClients.get(language);
   if (existing && existing.ready) return { ok: true, client: existing, language };
 
-  const server = serverFor(language);
-  if (!server) return { ok: false, error: `no hay servidor LSP para ${language}` };
+  const enCurso = lspStarts.get(language);
+  if (enCurso) return enCurso;
 
-  const existeServidor = path.isAbsolute(server.command)
-    ? fsSync.existsSync(server.command)
-    : comandoEnPath(server.command);
-  if (!existeServidor) {
-    return {
-      ok: false,
-      error: `No se encontró ${server.command}. Instálalo o configura su ruta en lspServers.`,
-    };
-  }
+  const arranque = (async () => {
+    const server = serverFor(language);
+    if (!server) return { ok: false, error: `no hay servidor LSP para ${language}` };
 
-  const client = new LspClient({
-    language,
-    rootPath: state.cwd,
-    onDiagnostics: (uri, diagnostics) => {
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('lsp:diagnostics', { uri, diagnostics });
-      }
-    },
-    onLog: (text) => console.error(`[lsp ${language}] ${text}`),
-  });
+    const existeServidor = path.isAbsolute(server.command)
+      ? fsSync.existsSync(server.command)
+      : comandoEnPath(server.command);
+    if (!existeServidor) {
+      return {
+        ok: false,
+        error: `No se encontró ${server.command}. Instálalo o configura su ruta en lspServers.`,
+      };
+    }
 
-  client.setServerCommand(server);
+    const client = new LspClient({
+      language,
+      rootPath: state.cwd,
+      onDiagnostics: (uri, diagnostics) => {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('lsp:diagnostics', { uri, diagnostics });
+        }
+      },
+      onLog: (text) => console.error(`[lsp ${language}] ${text}`),
+    });
 
+    client.setServerCommand(server);
+
+    try {
+      await client.start();
+      lspClients.set(language, client);
+      return { ok: true, client, language };
+    } catch (error) {
+      client.stop();
+      const message = error instanceof Error ? error.message : String(error);
+      return { ok: false, error: `no se pudo arrancar ${server.command}: ${message}` };
+    }
+  })();
+
+  lspStarts.set(language, arranque);
   try {
-    await client.start();
-    lspClients.set(language, client);
-    return { ok: true, client, language };
-  } catch (error) {
-    client.stop();
-    const message = error instanceof Error ? error.message : String(error);
-    return { ok: false, error: `no se pudo arrancar ${server.command}: ${message}` };
+    return await arranque;
+  } finally {
+    lspStarts.delete(language);
   }
 }
-
 /** Abre un documento en el servidor del lenguaje. */
 ipcMain.handle('lsp:open', async (_event, payload) => {
   const filePath = String(payload?.path ?? '');
@@ -1454,8 +1527,13 @@ ipcMain.handle('lsp:rename', async (_event, payload) => {
         continue; // no es un file:// (p. ej. untitled:)
       }
       try {
-        const current = await fsp.readFile(target, 'utf8');
-        await fsp.writeFile(target, applyTextEdits(current, edits), 'utf8');
+        // Si el documento está abierto, el servidor calculó las posiciones
+        // sobre el buffer, no sobre el disco: aplicar el edit al disco con un
+        // buffer sucio desplazaba y corrompía el fichero.
+        const current = client.textoDe(uri) ?? await fsp.readFile(target, 'utf8');
+        const siguiente = applyTextEdits(current, edits);
+        await fsp.writeFile(target, siguiente, 'utf8');
+        if (client.textoDe(uri) !== undefined) client.didChange(uri, siguiente);
         touched += 1;
       } catch {
         // fichero ilegible: se omite
@@ -1782,7 +1860,7 @@ ipcMain.handle('git:diff', async (_event, payload) => {
     if (!tracked.ok) {
       const fspLocal = require('node:fs/promises');
       try {
-        const content = await fspLocal.readFile(path.resolve(state.cwd, relative), 'utf8');
+        const content = await fspLocal.readFile(rutaAutorizada(state.cwd, relative), 'utf8');
         const lines = content.split('\n').map((text, index) => ({
           type: 'add',
           text,
@@ -1912,7 +1990,7 @@ ipcMain.handle('git:diff-hunks', async (_event, payload) => {
     const tracked = await runGit(['ls-files', '--error-unmatch', relative]);
     if (!tracked.ok) {
       try {
-        const content = await fsp.readFile(path.resolve(state.cwd, relative), 'utf8');
+        const content = await fsp.readFile(rutaAutorizada(state.cwd, relative), 'utf8');
         const all = content.split('\n').slice(0, 400);
         return {
           ok: true,
@@ -2389,22 +2467,34 @@ const turnCheckpoints = new Map();
 
 /** Turno en curso (clave de checkpoint). */
 let currentTurnKey = null;
+/** Tareas programadas por el agente en este turno. */
+let tareasAgenteDelTurno = new Set();
 
 /**
  * Guarda el estado original de un fichero antes de modificarlo.
  * Solo se guarda la primera vez por turno: es el estado al inicio del turno.
  */
-function recordCheckpoint(absolutePath, originalContent, llamadaId) {
-  // Registro plano para la tarjeta de revisión del turno.
-  if (!cambiosDelTurno.some((entrada) => entrada.absolute === absolutePath)) {
+function recordCheckpoint(
+  absolutePath,
+  originalContent,
+  llamadaId,
+  sessionId = state.sessionId,
+  turno = currentTurnKey,
+) {
+  const sesion = String(sessionId ?? state.sessionId ?? 'actual');
+  const esSesionActual = !sessionId || sessionId === state.sessionId;
+  const esTurnoActual = turno == null || turno === currentTurnKey;
+
+  // La tarjeta de revisión y el checkpoint rápido son del turno activo. Un
+  // subagente que termina después no debe ensuciar el turno de otra sesión.
+  if (esSesionActual && esTurnoActual && !cambiosDelTurno.some((entrada) => entrada.absolute === absolutePath)) {
     cambiosDelTurno.push({ absolute: absolutePath, original: originalContent });
   }
 
-  // La trayectoria guarda el snapshot por paso; los checkpoints por turno siguen
-  // sirviendo para el revert rápido de todo el turno.
-  trayectoria.anotarEscritura(claveDeTrayectoria(), absolutePath, originalContent, llamadaId);
+  // La trayectoria sí guarda el snapshot en la sesión que originó la escritura.
+  trayectoria.anotarEscritura(sesion, absolutePath, originalContent, llamadaId);
 
-  if (currentTurnKey === null) return;
+  if (!esSesionActual || currentTurnKey === null || turno !== currentTurnKey) return;
   const snapshot = turnCheckpoints.get(currentTurnKey);
   if (!snapshot || snapshot.has(absolutePath)) return;
   snapshot.set(absolutePath, originalContent);
@@ -2508,7 +2598,9 @@ ipcMain.handle('lsp:apply-action', async (_event, payload = {}) => {
     for (const u of uris) {
       const destino = rutaDeUri(u);
       try {
-        textos.set(u, await fsp.readFile(destino, 'utf8'));
+        // Mismo criterio que rename: si el documento está abierto, el servidor
+        // calculó el edit sobre su buffer, no sobre el fichero del disco.
+        textos.set(u, client.textoDe(u) ?? await fsp.readFile(destino, 'utf8'));
         rutas.set(u, destino);
       } catch {
         // Fichero ilegible: se omite.
@@ -2525,14 +2617,15 @@ ipcMain.handle('lsp:apply-action', async (_event, payload = {}) => {
       await fsp.writeFile(destino, contenido, 'utf8');
       ficheros += 1;
 
-      // Mantener el servidor al día con lo que acabamos de escribir.
-      try {
-        client.notify('textDocument/didChange', {
-          textDocument: { uri: u, version: null },
-          contentChanges: [{ text: contenido }],
-        });
-      } catch {
-        // Si falla la notificación, el servidor se resincroniza al reabrir.
+      // Mantener versión y buffer del servidor al día. Un `version: null`
+      // dejaba que el editor reenviara una versión repetida que el servidor
+      // descartaba, desalineando las siguientes ediciones.
+      if (client.textoDe(u) !== undefined) {
+        try {
+          client.didChange(u, contenido);
+        } catch {
+          // Si falla, el servidor se resincroniza al reabrir.
+        }
       }
     }
 
@@ -2564,7 +2657,10 @@ ipcMain.handle('search:run', async (_event, payload = {}) => {
     if (resultados.length >= limite) break;
     let contenido;
     try {
-      contenido = await fsp.readFile(path.join(raiz, relativa), 'utf8');
+      const buffer = await fsp.readFile(path.join(raiz, relativa));
+      // No convertir Latin-1/Windows-1252 a UTF-8: corrompe acentos al reemplazar.
+      if (!isUtf8(buffer)) continue;
+      contenido = buffer.toString('utf8');
     } catch {
       continue;
     }
@@ -2597,7 +2693,9 @@ ipcMain.handle('search:replace', async (_event, payload = {}) => {
     const absoluta = path.join(raiz, relativa);
     let contenido;
     try {
-      contenido = await fsp.readFile(absoluta, 'utf8');
+      const buffer = await fsp.readFile(absoluta);
+      if (!isUtf8(buffer)) continue;
+      contenido = buffer.toString('utf8');
     } catch {
       continue;
     }
@@ -2829,10 +2927,20 @@ ipcMain.handle('trajectory:preview', async (_event, payload) => {
 
 /** Revierte la conversación a un paso concreto. */
 ipcMain.handle('trajectory:revert', async (_event, payload) => {
-  await trayectoria.asegurar(claveDeTrayectoria());
-  const indice = Number(payload?.indice ?? 0);
-  const resultado = await trayectoria.revertirA(claveDeTrayectoria(), indice);
-  if (!resultado.ok) return resultado;
+  if (state.busy || cargandoSesion || revirtiendo) {
+    return { ok: false, error: 'espera a que el agente termine' };
+  }
+  const clave = claveDeTrayectoria();
+  const sessionId = state.sessionId;
+  revirtiendo = true;
+  try {
+    await trayectoria.asegurar(clave);
+    const indice = Number(payload?.indice ?? 0);
+    const resultado = await trayectoria.revertirA(clave, indice);
+    if (!resultado.ok) return resultado;
+    if (state.sessionId !== sessionId) {
+      return { ok: false, error: 'la conversación cambió durante el revert' };
+    }
 
   /*
    * Solo se restauran ficheros. El historial NO se recorta aquí: durante el turno
@@ -2840,7 +2948,10 @@ ipcMain.handle('trajectory:revert', async (_event, payload) => {
    * índice guardado no es fiable y recortar borraría la conversación entera. Para
    * deshacer también los mensajes está el revert por turno, que sí conoce su corte.
    */
-  return resultado;
+    return resultado;
+  } finally {
+    revirtiendo = false;
+  }
 });
 
 /** El renderer responde a una propuesta de diff. */
@@ -2886,7 +2997,7 @@ async function actualizarProyectoDeSesion(project) {
   if (!state.sessionId) return;
   try {
     const sessions = await getStore();
-    await sessions.setProject(state.sessionId, project);
+    await enColaTienda(() => sessions.setProject(state.sessionId, project));
   } catch {
     // best-effort: el estado en memoria ya representa la elección
   }
@@ -3126,17 +3237,26 @@ ipcMain.handle('tests:run', async () => {
       cwd: state.cwd,
       waitDurationSeconds: 10000,
       taskName: 'Test run',
-    });
+    }, { sessionId: state.sessionId, turno: currentTurnKey });
   }
 
   const resumen = testrunner.parsearSalida(salida.content);
-  const codigo = Number((salida.content.match(/exit code: (-?\d+)/) ?? [])[1] ?? (salida.isError ? 1 : 0));
+  const codigoDetectado = /exit code: (-?\d+)/.exec(salida.content);
+  const codigo = codigoDetectado
+    ? Number(codigoDetectado[1])
+    : Number.isFinite(Number(salida.code))
+      ? Number(salida.code)
+      : null;
+  const sigueEnSegundoPlano = /sigue en ejecución|CommandId:/i.test(salida.content);
+  const bien = codigo === null || sigueEnSegundoPlano
+    ? null
+    : testrunner.exito(codigo, resumen);
 
   const resultado = {
     framework: detectado.nombre,
     comando: detectado.comando,
     resumen,
-    bien: testrunner.exito(codigo, resumen),
+    bien,
     cuando: new Date().toISOString(),
     salida: resumen.reconocido ? undefined : salida.content.slice(0, 20000),
   };
@@ -3267,6 +3387,7 @@ ipcMain.handle('projects:list', async () => {
 
 /** Activa un proyecto conocido, sin diálogo. */
 ipcMain.handle('project:select', async (_event, target) => {
+  if (state.busy || cargandoSesion || revirtiendo) return { ok: false, error: 'espera a que el agente termine' };
   const cwd = path.resolve(String(target ?? ''));
   const proyecto = state.projects.find((p) => path.resolve(p.path) === cwd);
   if (!proyecto || !(await esDirectorio(cwd))) {
@@ -3278,6 +3399,7 @@ ipcMain.handle('project:select', async (_event, target) => {
   state.remote = null;
   state.cwd = cwd;
   state.project = cwd;
+  olvidarRaices();
   registrarRaiz(cwd);
   registrarProyecto(cwd);
   terminalCwd = null;
@@ -3293,6 +3415,7 @@ ipcMain.handle('project:select', async (_event, target) => {
 
 /** Desasocia la conversación de cualquier proyecto sin cambiar el workspace. */
 ipcMain.handle('project:none', async () => {
+  if (state.busy || cargandoSesion || revirtiendo) return { ok: false, error: 'espera a que el agente termine' };
   state.project = null;
   await actualizarProyectoDeSesion(null);
   try {
@@ -3305,6 +3428,7 @@ ipcMain.handle('project:none', async () => {
 
 /** Crea una carpeta nueva y la registra como proyecto. */
 ipcMain.handle('project:create', async (_event, target) => {
+  if (state.busy || cargandoSesion || revirtiendo) return { ok: false, error: 'espera a que el agente termine' };
   let cwd;
   if (process.env.OPENGRAVITY_TEST === '1' && typeof target === 'string' && target.trim()) {
     // Hook de verificación: solo existe en el modo de pruebas.
@@ -3326,14 +3450,19 @@ ipcMain.handle('project:create', async (_event, target) => {
     if (result.canceled || !result.filePath) return null;
     cwd = path.resolve(result.filePath);
   }
+  if (state.busy || cargandoSesion || revirtiendo) return { ok: false, error: 'espera a que el agente termine' };
   try {
     await fsp.mkdir(cwd, { recursive: false });
   } catch (error) {
     return { ok: false, error: `No se pudo crear el proyecto: ${error?.message ?? error}` };
   }
 
+  remoteProject.cerrar();
+  if (state.remote?.direct) await sshfs.desmontar(state.remote.drive);
+  state.remote = null;
   state.cwd = cwd;
   state.project = cwd;
+  olvidarRaices();
   registrarRaiz(cwd);
   registrarProyecto(cwd);
   terminalCwd = null;
@@ -3349,6 +3478,7 @@ ipcMain.handle('project:create', async (_event, target) => {
 
 /** Quita un proyecto del selector; no borra su carpeta. */
 ipcMain.handle('project:remove', async (_event, target) => {
+  if (state.busy || cargandoSesion || revirtiendo) return { ok: false, error: 'espera a que el agente termine' };
   const cwd = path.resolve(String(target ?? ''));
   state.projects = state.projects.filter((p) => path.resolve(p.path) !== cwd);
   if (state.project === cwd) {
@@ -3365,18 +3495,23 @@ ipcMain.handle('project:remove', async (_event, target) => {
 
 /** Abre un directorio como workspace. */
 ipcMain.handle('workspace:open', async () => {
+  if (state.busy || cargandoSesion || revirtiendo) return null;
   const result = await dialog.showOpenDialog(mainWindow, {
     properties: ['openDirectory'],
     title: 'Abrir carpeta',
   });
 
   if (result.canceled || result.filePaths.length === 0) return null;
+  if (state.busy || cargandoSesion || revirtiendo) {
+    return { cwd: state.cwd, cancelled: true };
+  }
 
   remoteProject.cerrar();
   if (state.remote?.direct) await sshfs.desmontar(state.remote.drive);
   state.remote = null;
   state.cwd = result.filePaths[0];
   state.project = state.cwd;
+  olvidarRaices();
   registrarRaiz(state.cwd);
   registrarProyecto(state.cwd);
   terminalCwd = null;
@@ -3397,6 +3532,7 @@ ipcMain.handle('workspace:open', async () => {
 
 /** Cambia el workspace a una carpeta ya conocida (proyectos recientes). */
 ipcMain.handle('workspace:set', async (_event, target) => {
+  if (state.busy || cargandoSesion || revirtiendo) return { ok: false, error: 'espera a que el agente termine' };
   const cwd = path.resolve(String(target ?? ''));
   if (!(await esDirectorio(cwd))) {
     return { ok: false, error: 'La carpeta del proyecto ya no existe.' };
@@ -3415,8 +3551,14 @@ ipcMain.handle('workspace:set', async (_event, target) => {
     return { ok: false, error: 'Ese proyecto no está en el historial. Ábrelo con New Project.' };
   }
 
+  // Cambiar a un proyecto local no puede seguir ejecutando comandos en el SSH
+  // del proyecto anterior.
+  remoteProject.cerrar();
+  if (state.remote?.direct) await sshfs.desmontar(state.remote.drive);
+  state.remote = null;
   state.cwd = cwd;
   state.project = cwd;
+  olvidarRaices();
   registrarRaiz(state.cwd);
   registrarProyecto(state.cwd);
   terminalCwd = null;
@@ -3578,10 +3720,34 @@ ipcMain.handle('settings:set', async (_event, payload) => {
   return { providerId: state.providerId, model: state.model };
 });
 
-/** Lee las preferencias de la UI. */
-ipcMain.handle('prefs:get', async () => state.prefs);
+const MASCARA_SECRETO = '••••••••';
+
+/** Lee las preferencias sin entregar secretos en claro al renderer. */
+ipcMain.handle('prefs:get', async () => {
+  const vista = { ...state.prefs };
+  if (vista.apiKeys && typeof vista.apiKeys === 'object') {
+    vista.apiKeys = Object.fromEntries(
+      Object.entries(vista.apiKeys).map(([id, valor]) => [id, valor ? MASCARA_SECRETO : '']),
+    );
+  }
+  if (typeof vista.remoteToken === 'string' && vista.remoteToken.length > 0) {
+    vista.remoteToken = MASCARA_SECRETO;
+  }
+  return vista;
+});
 /** Actualiza preferencias (merge superficial) y las persiste. */
-ipcMain.handle('prefs:set', async (_event, patch) => {
+ipcMain.handle('prefs:set', async (_event, patchOriginal) => {
+  const patch = patchOriginal && typeof patchOriginal === 'object' ? { ...patchOriginal } : patchOriginal;
+  if (patch && typeof patch === 'object' && patch.apiKeys && typeof patch.apiKeys === 'object') {
+    // La máscara no debe sobrescribir una clave real, y `null` la borra.
+    const claves = { ...(state.prefs.apiKeys ?? {}) };
+    for (const [id, valor] of Object.entries(patch.apiKeys)) {
+      if (valor === null) delete claves[id];
+      else if (typeof valor === 'string' && valor !== MASCARA_SECRETO) claves[id] = valor;
+    }
+    patch.apiKeys = claves;
+  }
+  if (patch && patch.remoteToken === MASCARA_SECRETO) delete patch.remoteToken;
   if (patch && typeof patch === 'object') {
     const cambiaElTema =
       'theme' in patch || 'themeContrast' in patch || 'accent' in patch;
@@ -3605,8 +3771,13 @@ ipcMain.handle('prefs:set', async (_event, patch) => {
 
 /** Borra una conversación. */
 ipcMain.handle('sessions:delete', async (_event, id) => {
+  if (state.busy || cargandoSesion || revirtiendo) return { ok: false, error: 'espera a que el agente termine' };
   const sessions = await getStore();
-  await sessions.delete(String(id));
+  await enColaTienda(() => sessions.delete(String(id)));
+  await trayectoria.olvidarTrayectoria(String(id)).catch(() => {});
+  for (let i = colaResultadosSubagentes.length - 1; i >= 0; i -= 1) {
+    if (colaResultadosSubagentes[i]?.sessionId === String(id)) colaResultadosSubagentes.splice(i, 1);
+  }
   return { ok: true };
 });
 
@@ -3701,7 +3872,16 @@ function alTerminarUnaTarea(tarea) {
     nombre: tarea.nombre,
     exitCode: tarea.exitCode,
     salida: recorte,
+    sessionId: tarea.sessionId ?? null,
   });
+
+  /*
+   * Una tarea lanzada en otra conversación no puede despertar la actual. Se
+   * descarta su nota; su salida sigue disponible con command_status.
+   */
+  if (tarea.sessionId && state.sessionId && tarea.sessionId !== state.sessionId) {
+    return;
+  }
 
   // Con el turno abierto, la nota entra en el siguiente paso del bucle.
   notaDeTareaPendiente = texto;
@@ -3709,7 +3889,10 @@ function alTerminarUnaTarea(tarea) {
   // Con el turno cerrado, se despierta uno nuevo.
   if (!state.busy) {
     notaDeTareaPendiente = null;
-    mainWindow.webContents.send('task:wake', { texto });
+    mainWindow.webContents.send('task:wake', {
+      texto,
+      sessionId: tarea.sessionId ?? state.sessionId ?? null,
+    });
   }
 }
 
@@ -3760,15 +3943,15 @@ ipcMain.handle('image:generate', async (_event, payload) => {
     const cuenta = await cuentaGoogleConectada();
     if (!cuenta.conectada) return { ok: false, error: errorDeLogin() };
 
-    let navegador = require('./tools-extra.cjs').navegadorIntegrado();
+    let navegador = require('./tools-extra.cjs').navegadorIntegrado(true);
     if (!navegador) {
-      openBuiltInBrowser(URL_FLOW, { oculto: true });
+      openBuiltInBrowser(URL_FLOW, { oculto: true, flow: true });
       await new Promise((r) => setTimeout(r, 8000));
-      navegador = require('./tools-extra.cjs').navegadorIntegrado();
+      navegador = require('./tools-extra.cjs').navegadorIntegrado(true);
     }
     if (!navegador) return { ok: false, error: 'no se pudo abrir el navegador integrado' };
 
-    const destino = payload?.path ? path.resolve(state.cwd, String(payload.path)) : null;
+    const destino = payload?.path ? rutaAutorizada(state.cwd, String(payload.path)) : null;
 
     return await generarEnFlow(navegador, {
       prompt,
@@ -3788,7 +3971,7 @@ ipcMain.handle('google:status', async () => {
 ipcMain.handle('google:connect', async () => {
   const { openBuiltInBrowser } = require('./tools-extra.cjs');
   try {
-    await openBuiltInBrowser('https://accounts.google.com/ServiceLogin?continue=https://flow.google.com/');
+    await openBuiltInBrowser('https://accounts.google.com/ServiceLogin?continue=https://flow.google.com/', { flow: true });
     return { ok: true };
   } catch (error) {
     return { ok: false, error: String(error) };
@@ -3799,7 +3982,7 @@ ipcMain.handle('google:connect', async () => {
 ipcMain.handle('google:disconnect', async () => {
   const { session } = require('electron');
   try {
-    const sesion = session.fromPartition('persist:opengravity-browser');
+    const sesion = session.fromPartition('persist:opengravity-flow');
     await sesion.clearStorageData({ storages: ['cookies'] });
     return { ok: true };
   } catch (error) {
@@ -3994,7 +4177,11 @@ ipcMain.handle('app:choose-download-dir', async () => {
 ipcMain.handle('browser:clear-history', async () => {
   const { session } = require('electron');
   try {
-    await session.fromPartition('persist:opengravity-browser').clearCache();
+    await Promise.all([
+      session.fromPartition('persist:opengravity-browser').clearCache(),
+      session.fromPartition('persist:opengravity-agent-browser').clearCache(),
+      session.fromPartition('persist:opengravity-flow').clearCache(),
+    ]);
     return { ok: true };
   } catch (error) {
     return { ok: false, error: String(error) };
@@ -4005,6 +4192,8 @@ ipcMain.handle('browser:clear-history', async () => {
 ipcMain.handle('shell:open-external', async (_event, url) => {
   const verdict = isUrlAllowed(String(url), state.prefs.networkRules);
   if (!verdict.allowed) return { ok: false, error: verdict.reason };
+  const publica = await validarUrlPublica(String(url));
+  if (!publica.ok) return { ok: false, error: publica.error };
   await shell.openExternal(String(url));
   return { ok: true };
 });
@@ -4013,7 +4202,9 @@ ipcMain.handle('shell:open-external', async (_event, url) => {
 ipcMain.handle('browser:open', async (_event, url) => {
   const verdict = isUrlAllowed(String(url), state.prefs.networkRules);
   if (!verdict.allowed) return { ok: false, error: verdict.reason };
-  openBuiltInBrowser(String(url));
+  const publica = await validarUrlPublica(String(url));
+  if (!publica.ok) return { ok: false, error: publica.error };
+  await openBuiltInBrowser(String(url));
   return { ok: true };
 });
 
@@ -4216,7 +4407,7 @@ ipcMain.handle('sessions:rename', async (_event, id, title) => {
   titulosManuales.add(String(id));
   const sessions = await getStore();
   try {
-    await sessions.rename(id, String(title ?? '').slice(0, 120));
+    await enColaTienda(() => sessions.rename(id, String(title ?? '').slice(0, 120)));
   } catch (error) {
     // Si no se guardó, el título automático puede seguir gestionando la sesión.
     titulosManuales.delete(String(id));
@@ -4250,7 +4441,8 @@ async function applyRetention() {
     if (meta.id === state.sessionId) continue;
 
     try {
-      await sessions.delete(meta.id);
+      await enColaTienda(() => sessions.delete(meta.id));
+      await trayectoria.olvidarTrayectoria(meta.id).catch(() => {});
       removed += 1;
     } catch {
       // si una falla, se sigue con el resto
@@ -4258,6 +4450,24 @@ async function applyRetention() {
   }
 
   return { ok: true, removed, days };
+}
+
+/** Apaga los cron no-daemon creados por el agente en el turno que termina. */
+async function cerrarTareasAgenteDelTurno() {
+  if (tareasAgenteDelTurno.size === 0) return;
+  const ids = new Set(tareasAgenteDelTurno);
+  tareasAgenteDelTurno = new Set();
+  await mutarScheduled((tareas) => {
+    let changed = false;
+    for (const tarea of tareas) {
+      if (!ids.has(tarea.id)) continue;
+      if (tarea.createdBy === 'agent' && tarea.mode === 'cron' && tarea.isDaemon !== true) {
+        tarea.enabled = false;
+        changed = true;
+      }
+    }
+    return { escribir: changed, resultado: null };
+  }).catch(() => {});
 }
 
 /** Aplica la retención ahora y devuelve cuántas se borraron. */
@@ -4270,7 +4480,7 @@ ipcMain.handle('sessions:list', async () => {
 
 /** Empieza una conversación nueva de verdad: resetea el hilo del motor. */
 ipcMain.handle('sessions:new', async () => {
-  if (state.busy) return { ok: false, error: 'el agente está trabajando' };
+  if (state.busy || cargandoSesion || revirtiendo) return { ok: false, error: 'el agente está trabajando' };
   resetSessionState(state, turnCheckpoints, cambiosDelTurno);
   currentTurnKey = null;
   return { ok: true };
@@ -4278,45 +4488,73 @@ ipcMain.handle('sessions:new', async () => {
 
 /** Carga una sesión en el estado actual. */
 ipcMain.handle('sessions:load', async (_event, id) => {
-  const sessions = await getStore();
-  const loaded = await sessions.load(id);
+  if (state.busy) return { ok: false, error: 'el agente está trabajando' };
+  if (cargandoSesion || revirtiendo) return { ok: false, error: 'ya se está cargando otra conversación' };
+  cargandoSesion = true;
+  try {
+    const sessions = await getStore();
+    const loaded = await sessions.load(id);
 
-  // Cargar otra conversación no puede heredar sus checkpoints ni su tarjeta de
-  // revisión: un revert posterior desharía ficheros de la sesión anterior.
-  resetSessionState(state, turnCheckpoints, cambiosDelTurno);
-  currentTurnKey = null;
+    // Cargar otra conversación no puede heredar sus checkpoints ni su tarjeta de
+    // revisión: un revert posterior desharía ficheros de la sesión anterior.
+    resetSessionState(state, turnCheckpoints, cambiosDelTurno);
+    currentTurnKey = null;
 
-  state.sessionId = loaded.meta.id;
-  state.messages = loaded.messages;
-  state.providerId = loaded.meta.provider;
-  state.model = loaded.meta.model;
+    // Si la conversación es local, no heredar el modo remoto de la anterior.
+    const cwdCargado = String(loaded.meta.cwd ?? '');
+    const esRemota = cwdCargado.includes(`${path.sep}remote-workspaces${path.sep}`);
+    if (state.remote && !esRemota) {
+      remoteProject.cerrar();
+      if (state.remote.direct) await sshfs.desmontar(state.remote.drive);
+      state.remote = null;
+    }
 
-  // La conversación puede traer su propio workspace. Si ya no existe, no se
-  // arrastra la ruta fantasma a los siguientes turnos.
-  if (typeof loaded.meta.cwd === 'string' && (await esDirectorio(loaded.meta.cwd))) {
-    state.cwd = loaded.meta.cwd;
-    registrarRaiz(state.cwd);
-  } else if (!(await esDirectorio(state.cwd))) {
-    state.cwd = cwdInicial();
-    registrarRaiz(state.cwd);
+    state.sessionId = loaded.meta.id;
+    state.messages = loaded.messages;
+    state.providerId = loaded.meta.provider;
+    state.model = loaded.meta.model;
+
+    // La conversación puede traer su propio workspace. Si ya no existe, no se
+    // arrastra la ruta fantasma a los siguientes turnos.
+    const cwdAnterior = state.cwd;
+    if (typeof loaded.meta.cwd === 'string' && (await esDirectorio(loaded.meta.cwd))) {
+      state.cwd = loaded.meta.cwd;
+      if (path.resolve(state.cwd) !== path.resolve(cwdAnterior)) olvidarRaices();
+      registrarRaiz(state.cwd);
+    } else if (!(await esDirectorio(state.cwd))) {
+      state.cwd = cwdInicial();
+      olvidarRaices();
+      registrarRaiz(state.cwd);
+    }
+
+    /*
+     * Sesiones anteriores a `project` se agrupan bajo su cwd, que es lo que la
+     * interfaz mostraba antes. Las nuevas guardan null explícito para No Project.
+     */
+    const proyectoCargado = 'project' in loaded.meta ? loaded.meta.project : loaded.meta.cwd;
+    state.project =
+      typeof proyectoCargado === 'string' && (await esDirectorio(proyectoCargado))
+        ? path.resolve(proyectoCargado)
+        : null;
+    if (state.project) registrarProyecto(state.project);
+
+    // Cargar el historial debe cargar también sus snapshots. Si no, el primer
+    // paso nuevo escribe una trayectoria vacía y borra el undo anterior.
+    try {
+      await trayectoria.asegurar(loaded.meta.id);
+    } catch {
+      // sin trayectoria se sigue, pero no se debe escribir una vacía
+    }
+
+    return { meta: loaded.meta, project: state.project, messages: loaded.messages };
+  } finally {
+    cargandoSesion = false;
   }
-
-  /*
-   * Sesiones anteriores a `project` se agrupan bajo su cwd, que es lo que la
-   * interfaz mostraba antes. Las nuevas guardan null explícito para No Project.
-   */
-  const proyectoCargado = 'project' in loaded.meta ? loaded.meta.project : loaded.meta.cwd;
-  state.project =
-    typeof proyectoCargado === 'string' && (await esDirectorio(proyectoCargado))
-      ? path.resolve(proyectoCargado)
-      : null;
-  if (state.project) registrarProyecto(state.project);
-
-  return { meta: loaded.meta, project: state.project, messages: loaded.messages };
 });
 
 /// Control de cancelación de la ejecución en curso.
 let currentAbort = null;
+let abortSolicitado = false;
 
 /**
  * Deshace hasta el mensaje indicado: trunca el historial y reescribe la sesión.
@@ -4389,7 +4627,8 @@ ipcMain.handle('scheduled:save', async (_event, task) => {
   } else if (modo === 'cron' && task.cron) {
     try {
       const proxima = siguienteEjecucion(compilarCron(task.cron));
-      nextRunAt = (proxima ?? new Date()).toISOString();
+      if (!proxima) return { ok: false, error: 'la expresión cron no tiene próxima ejecución' };
+      nextRunAt = proxima.toISOString();
     } catch {
       return { ok: false, error: 'expresión cron inválida' };
     }
@@ -4406,6 +4645,7 @@ ipcMain.handle('scheduled:save', async (_event, task) => {
     maxTriggers: Number.isFinite(Number(task.maxTriggers)) ? Number(task.maxTriggers) : null,
     triggers: Number(task.triggers ?? 0),
     createdBy: task.createdBy === 'agent' ? 'agent' : 'user',
+    isDaemon: task.isDaemon === true,
     enabled: task.enabled !== false,
     nextRunAt,
     lastRunAt: task.lastRunAt ?? null,
@@ -4473,8 +4713,11 @@ function startScheduler() {
   setInterval(async () => {
     if (state.busy) return;
 
-    const tasks = await readScheduled();
-    let changed = false;
+    const disparos = [];
+    // Tick y guardado comparten el mismo candado que la UI: leer fuera de él
+    // resucitaba tareas borradas o perdía tareas nuevas.
+    await mutarScheduled((tasks) => {
+      let changed = false;
 
     for (const task of tasks) {
       if (task.enabled === false) continue;
@@ -4499,7 +4742,11 @@ function startScheduler() {
       } else if (task.mode === 'cron' && task.cron) {
         try {
           const proxima = siguienteEjecucion(compilarCron(task.cron));
-          const base = proxima ?? new Date(Date.now() + 60000);
+          if (!proxima) {
+            task.enabled = false;
+            continue;
+          }
+          const base = proxima;
           // El jitter dispersa el disparo para que varias tareas de la misma hora no
           // salgan todas en el mismo segundo.
           const dispersion = Number(task.jitterSeconds ?? 0);
@@ -4518,10 +4765,15 @@ function startScheduler() {
         if (task.triggers >= Number(task.maxTriggers)) task.enabled = false;
       }
 
-      mainWindow?.webContents.send('scheduled:fire', { id: task.id, prompt: task.prompt });
+      disparos.push({ id: task.id, prompt: task.prompt });
     }
 
-    if (changed) await writeScheduled(tasks);
+      return { escribir: changed, resultado: null };
+    });
+
+    for (const disparo of disparos) {
+      mainWindow?.webContents.send('scheduled:fire', disparo);
+    }
   }, 60000).unref?.();
 }
 
@@ -4619,38 +4871,69 @@ ipcMain.handle('chat:revert-preview', async (_event, keepCount) => {
 });
 
 ipcMain.handle('chat:revert', async (_event, keepCount) => {
-  if (state.busy) {
+  if (state.busy || cargandoSesion || revirtiendo) {
     return { ok: false, error: 'espera a que el agente termine' };
   }
 
-  const keep = Math.max(0, Math.floor(Number(keepCount)));
-  const resultado = await restoreCheckpoints(keep);
+  // Capturar la sesión al empezar: si cambia durante el revert, el truncado
+  // no puede aplicarse a la conversación nueva.
+  const sessionId = state.sessionId;
+  const mensajes = state.messages;
 
-  if (resultado.failures.length > 0) {
-    return {
-      ok: false,
-      error: `No se pudieron restaurar ${resultado.failures.length} fichero(s). No se recortó la conversación.`,
-      restoredFiles: resultado.restored,
-      failures: resultado.failures,
-    };
-  }
+  revirtiendo = true;
+  try {
+    const keep = Math.max(0, Math.floor(Number(keepCount)));
+    const resultado = await restoreCheckpoints(keep);
 
-  state.messages = state.messages.slice(0, keep);
-
-  if (state.sessionId) {
-    try {
-      const sessions = await getStore();
-      await sessions.rewrite(state.sessionId, state.messages);
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    if (resultado.failures.length > 0) {
+      return {
+        ok: false,
+        error: `No se pudieron restaurar ${resultado.failures.length} fichero(s). No se recortó la conversación.`,
+        restoredFiles: resultado.restored,
+        failures: resultado.failures,
+      };
     }
-  }
 
-  return { ok: true, messages: state.messages.length, restoredFiles: resultado.restored };
+    if (state.sessionId !== sessionId) {
+      return { ok: false, error: 'la conversación cambió durante el revert' };
+    }
+    state.messages = mensajes.slice(0, keep);
+
+    if (sessionId) {
+      try {
+        const sessions = await getStore();
+        await enColaTienda(() => sessions.rewrite(sessionId, state.messages));
+      } catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : String(error) };
+      }
+    }
+
+    return { ok: true, messages: state.messages.length, restoredFiles: resultado.restored };
+  } finally {
+    revirtiendo = false;
+  }
 });
 
 /** Cancela la ejecución actual del agente. */
 ipcMain.handle('chat:abort', async () => {
+  abortSolicitado = true;
+
+  // Una tarjeta abierta no debe sobrevivir al turno que la pidió. Al resolverla
+  // el tool deja de esperar; el bucle verá la señal abortada en la siguiente
+  // llamada al proveedor y cerrará el turno.
+  for (const [id, resolver] of [...pendingPlans]) {
+    pendingPlans.delete(id);
+    resolver({ approved: false, feedback: 'turno cancelado por el usuario' });
+  }
+  for (const [id, resolver] of [...pendingQuestions]) {
+    pendingQuestions.delete(id);
+    resolver(null);
+  }
+  for (const [id, resolver] of [...pendingDiffs]) {
+    pendingDiffs.delete(id);
+    resolver(false);
+  }
+
   if (currentAbort) {
     currentAbort.abort();
     return { ok: true };
@@ -4671,18 +4954,38 @@ let cachePlugins = {
   errores: [],
 };
 
-/** Resúmenes de subagentes pendientes de entregar al turno activo o a uno nuevo. */
+/** Resúmenes de subagentes pendientes, etiquetados por conversación de origen. */
 const colaResultadosSubagentes = [];
 
-function entregarResultadoSubagente(texto) {
+function entregarResultadoSubagente(texto, sessionId = state.sessionId) {
   if (!texto) return;
+  const origen = sessionId ?? null;
+  // Un resultado de otra conversación no puede inyectarse en la actual; se
+  // conserva para cuando el usuario vuelva a abrirla.
+  if (origen && state.sessionId && origen !== state.sessionId) {
+    colaResultadosSubagentes.push({ sessionId: origen, texto });
+    return;
+  }
   if (state.busy) {
-    colaResultadosSubagentes.push(texto);
+    colaResultadosSubagentes.push({ sessionId: origen, texto });
     return;
   }
   if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send('task:wake', { texto });
+    mainWindow.webContents.send('task:wake', { texto, sessionId: origen });
   }
+}
+
+/** Extrae los resúmenes que pertenecen a la sesión indicada. */
+function extraerResultadosSubagentes(sessionId) {
+  const actuales = [];
+  const resto = [];
+  for (const entrada of colaResultadosSubagentes) {
+    if (!entrada.sessionId || entrada.sessionId === sessionId) actuales.push(entrada.texto);
+    else resto.push(entrada);
+  }
+  colaResultadosSubagentes.length = 0;
+  colaResultadosSubagentes.push(...resto);
+  return actuales;
 }
 
 async function cerrarPlugins() {
@@ -4775,10 +5078,25 @@ ipcMain.handle('chat:send', async (event, payload) => {
     return { ok: true, planFeedback: true };
   }
 
-  if (state.busy) {
+  if (state.busy || cargandoSesion || revirtiendo) {
     return { ok: false, error: 'el agente ya está trabajando' };
   }
 
+  /*
+   * Reserva el turno antes del primer await. Si no, una carga de sesión o un
+   * segundo envío pueden colarse mientras se leen adjuntos y se prepara el
+   * proveedor, cuando `state.busy` todavía valía false.
+   */
+  state.busy = true;
+  tareasAgenteDelTurno = new Set();
+  const controller = new AbortController();
+  currentAbort = controller;
+  abortSolicitado = false;
+  if (!event.sender.isDestroyed()) {
+    event.sender.send('chat:event', { type: 'busy', busy: true });
+  }
+
+  try {
   const text = typeof payload === 'string' ? payload : String(payload?.text ?? '');
   const mentions = Array.isArray(payload?.mentions) ? payload.mentions.slice(0, 20) : [];
   const attachments = Array.isArray(payload?.attachments) ? payload.attachments.slice(0, 20) : [];
@@ -4946,12 +5264,12 @@ ipcMain.handle('chat:send', async (event, payload) => {
   if (!state.sessionId && state.prefs.saveHistory !== false) {
     try {
       const sessions = await getStore();
-      const created = await sessions.create({
+      const created = await enColaTienda(() => sessions.create({
         provider: state.providerId,
         model: state.model,
         cwd: state.cwd,
         project: state.project,
-      });
+      }));
       state.sessionId = created.id;
     } catch {
       state.sessionId = null;
@@ -5466,7 +5784,7 @@ ipcMain.handle('chat:send', async (event, payload) => {
         },
       },
     },
-    async execute(args) {
+    async execute(args, ctx) {
       const detectado = await testrunner.detectarFramework(state.cwd);
       if (!detectado) {
         return {
@@ -5495,11 +5813,39 @@ ipcMain.handle('chat:send', async (event, payload) => {
           cwd: state.cwd,
           waitDurationSeconds: Number(args?.waitDurationSeconds ?? 10000),
           taskName: 'Test run',
-        });
+        }, ctx);
       }
 
       const resumen = testrunner.parsearSalida(salida.content);
-      const codigo = Number((salida.content.match(/exit code: (-?\d+)/) ?? [])[1] ?? (salida.isError ? 1 : 0));
+      const codigoDetectado = /exit code: (-?\d+)/.exec(salida.content);
+      const codigo = codigoDetectado
+        ? Number(codigoDetectado[1])
+        : Number.isFinite(Number(salida.code))
+          ? Number(salida.code)
+          : null;
+      const sigueEnSegundoPlano = /sigue en ejecución|CommandId:/i.test(salida.content);
+      /*
+       * `run_command` devuelve el control a los 10 s y la suite sigue viva. No
+       * hay código de salida: asumir 0 convertía «aún ejecutándose» en «pasa».
+       */
+      if (codigo === null || sigueEnSegundoPlano) {
+        const aviso =
+          `La suite sigue ejecutándose en segundo plano` +
+          ` (${sigueEnSegundoPlano ? 'CommandId en la salida' : 'sin exit code'}). ` +
+          'No puedo confirmar que pase; consulta el comando o vuelve a ejecutar run_tests.';
+        state.ultimosTests = {
+          framework: detectado.nombre,
+          comando: detectado.comando,
+          resumen,
+          bien: null,
+          cuando: new Date().toISOString(),
+        };
+        send({ type: 'tests_result', ...state.ultimosTests });
+        return {
+          content: `${aviso}\n\n${salida.content.slice(0, 4000)}`,
+          isError: true,
+        };
+      }
       const bien = testrunner.exito(codigo, resumen);
 
       state.ultimosTests = {
@@ -5662,6 +6008,7 @@ ipcMain.handle('chat:send', async (event, payload) => {
           tareas.push(aviso);
           return { resultado: null };
         });
+        tareasAgenteDelTurno.add(id);
 
         const cuando = new Date(Date.now() + segundos * 1000);
         return {
@@ -5701,6 +6048,7 @@ ipcMain.handle('chat:send', async (event, payload) => {
         maxTriggers: Number.isFinite(maxIter) ? maxIter : null,
         jitterSeconds: jitter,
         createdBy: 'agent',
+        isDaemon,
         enabled: true,
         lastRunAt: null,
       };
@@ -5709,6 +6057,7 @@ ipcMain.handle('chat:send', async (event, payload) => {
         tareas.push(recurrente);
         return { resultado: null };
       });
+      tareasAgenteDelTurno.add(id);
 
       return {
         content:
@@ -5869,6 +6218,7 @@ ipcMain.handle('chat:send', async (event, payload) => {
       if (pedidos.length === 0) {
         return { content: 'No hay subagentes que lanzar. Especifica TypeName, Role y Prompt.', isError: true };
       }
+      const sessionIdOrigen = state.sessionId;
       if (
         !pedidos.every(
           (sub) =>
@@ -5900,6 +6250,12 @@ ipcMain.handle('chat:send', async (event, payload) => {
       const deEscritura = baseTools.filter((tool) => !HERRAMIENTAS_DE_LECTURA.has(tool.name));
 
       const lanzar = async (sub, indice, senalExterna, senalPadre) => {
+        // Capturar la identidad al lanzar: el subagente puede terminar después
+        // de que el usuario cambie de conversación.
+        const sessionIdSub = state.sessionId;
+        const turnoSub = currentTurnKey;
+        const cwdBaseSub = state.cwd;
+
         // Si viene `definition`, se resuelve contra las guardadas con define_subagent.
         let definicion = null;
         const referencia = sub?.definition ?? sub?.name;
@@ -5980,12 +6336,14 @@ ipcMain.handle('chat:send', async (event, payload) => {
         const controlador = new AbortController();
         // Si el usuario cancela el turno padre, sus subagentes también paran.
         senalPadre?.addEventListener('abort', () => controlador.abort(), { once: true });
+        if (senalPadre?.aborted) controlador.abort();
         /*
          * El presupuesto de fusión cancela este subagente concreto a través de
          * su señal. El registro conserva su propio controlador para que
          * `manage_subagent` lo siga viendo y pueda cancelarlo a mano.
          */
         senalExterna?.addEventListener('abort', () => controlador.abort(), { once: true });
+        if (senalExterna?.aborted) controlador.abort();
         const identificador = subagentes.registrar({
           nombre,
           rol,
@@ -6029,24 +6387,55 @@ ipcMain.handle('chat:send', async (event, payload) => {
           });
         }
 
+        const hooksSubagente = {
+          getCwd: () => cwdSubagente,
+          getReglas: () => prefs.hookRules ?? [],
+          getLimite: () => Number(prefs.toolOutputLimit ?? 16000),
+          getRestringir: () => state.prefs.restrictToWorkspace === true,
+        };
         const herramientas = new ToolRegistry().registerAll(
           disponibles.map((tool) =>
             // En un subagente el monitor bloquea sin preguntar: no debe abrir diálogos.
-            conMonitorDeSeguridad(guardTool(tool, preset, prefs, () => mainWindow), {
-              modo: modoMonitor === 'off' ? 'off' : 'block',
-              confirmar: async () => false,
-            }),
+            conHooks(
+              conMonitorDeSeguridad(guardTool(tool, preset, prefs, () => mainWindow), {
+                modo: modoMonitor === 'off' ? 'off' : 'block',
+                confirmar: async () => false,
+              }),
+              hooksSubagente,
+            ),
           ),
         );
         const emitir = (payload) => {
           if (payload.type === 'text' || payload.type === 'reasoning') return;
+
+          // La trayectoria también registra los pasos del subagente en SU sesión.
+          if (payload.type === 'tool_start') {
+            trayectoria.abrirPaso(sessionIdSub, {
+              herramienta: payload.call?.name ?? '',
+              argumentos: payload.call?.arguments ?? {},
+              llamadaId: payload.call?.id ?? null,
+              mensaje: null,
+              turno: turnoSub,
+            });
+          } else if (payload.type === 'tool_end') {
+            trayectoria.cerrarPasoPorLlamada(sessionIdSub, payload.call?.id ?? null, {
+              contenido: payload.content,
+              esError: payload.isError,
+            });
+          }
+
           send({
             ...payload,
             subagent: identificador,
             subagentLabel: nombre,
+            sessionId: sessionIdSub,
             ...(enTurnoDelPlanner ? { planner: true } : {}),
           });
         };
+
+        // Los pasos y snapshots van a la conversación capturada, no a la que
+        // esté abierta cuando el subagente termine.
+        await trayectoria.asegurar(sessionIdSub).catch(() => {});
 
         const ejecutarAgente = (modelo) => runAgent(
             {
@@ -6086,7 +6475,12 @@ ipcMain.handle('chat:send', async (event, payload) => {
               mensajeDeSistema: () => subagentes.recogerMensajes(identificador),
             },
             tarea,
-            { cwd: cwdSubagente, signal: controlador.signal },
+            {
+              cwd: cwdSubagente,
+              signal: controlador.signal,
+              sessionId: sessionIdSub,
+              turno: turnoSub,
+            },
           );
 
         try {
@@ -6104,7 +6498,7 @@ ipcMain.handle('chat:send', async (event, payload) => {
 
           let notaWorktree = '';
           if (worktree) {
-            const cierre = await worktreeMod.cerrar(state.cwd, worktree);
+            const cierre = await worktreeMod.cerrar(worktree.baseCwd ?? state.cwd, worktree);
             if (cierre.conservado) notaWorktree = `\n\n${cierre.nota}`;
           }
 
@@ -6113,15 +6507,19 @@ ipcMain.handle('chat:send', async (event, payload) => {
             rol,
             resumen: `${(resultado.text ?? '').trim()}${notaWorktree}`,
             error: null,
+            sessionId: sessionIdSub,
           };
         } catch (error) {
           subagentes.marcarTerminado(identificador, 'error');
-          if (worktree) await worktreeMod.cerrar(state.cwd, worktree).catch(() => {});
+          if (worktree) {
+            await worktreeMod.cerrar(worktree.baseCwd ?? cwdBaseSub, worktree).catch(() => {});
+          }
           return {
             nombre,
             rol,
             resumen: '',
             error: error instanceof Error ? error.message : String(error),
+            sessionId: sessionIdSub,
           };
         } finally {
           // Se deja un rato en el registro para que manage_subagent lo vea, y se libera.
@@ -6172,10 +6570,11 @@ ipcMain.handle('chat:send', async (event, payload) => {
       }
 
       void correrEnParalelo(tareas, { presupuestoMs: presupuestoFusion })
-        .then((carrera) => entregarResultadoSubagente(formatear(carrera)))
+        .then((carrera) => entregarResultadoSubagente(formatear(carrera), sessionIdOrigen))
         .catch((error) => {
           entregarResultadoSubagente(
             `Los subagentes fallaron: ${error instanceof Error ? error.message : String(error)}`,
+            sessionIdOrigen,
           );
         });
 
@@ -6285,8 +6684,18 @@ ipcMain.handle('chat:send', async (event, payload) => {
       const invokeSubagentBlocking = {
         ...invokeSubagentTool,
         async execute(args, ctx) {
-          return invokeSubagentTool.execute({ ...args, __bloquear: true }, ctx);
+          // El planificador solo verifica: sus subagentes tampoco escriben.
+          return invokeSubagentTool.execute(
+            { ...args, __bloquear: true, __soloLectura: true },
+            ctx,
+          );
         },
+      };
+      const hooksPlanner = {
+        getCwd: () => state.cwd,
+        getReglas: () => prefs.hookRules ?? [],
+        getLimite: () => Number(prefs.toolOutputLimit ?? 16000),
+        getRestringir: () => state.prefs.restrictToWorkspace === true,
       };
       const herramientasDelPlanner = new ToolRegistry().registerAll(
         [
@@ -6295,7 +6704,9 @@ ipcMain.handle('chat:send', async (event, payload) => {
           // Bloquea: necesita los resúmenes para decidir en este mismo turno.
           invokeSubagentBlocking,
           ...baseTools.filter((t) => HERRAMIENTAS_DE_LECTURA.has(t.name)),
-        ].map((tool) => guardTool(tool, preset, prefs, () => mainWindow)),
+        ].map((tool) =>
+          conHooks(guardTool(tool, preset, prefs, () => mainWindow), hooksPlanner),
+        ),
       );
 
       enTurnoDelPlanner = true;
@@ -6324,6 +6735,7 @@ ipcMain.handle('chat:send', async (event, payload) => {
           { cwd: state.cwd, signal: controller.signal },
         );
       } catch (error) {
+        ciclo.cancelarRevision();
         return {
           content:
             'El planificador falló: ' +
@@ -6339,6 +6751,7 @@ ipcMain.handle('chat:send', async (event, payload) => {
       send({ type: 'plan_handoff', fase: 'entregado', decision: entrega?.decision ?? null });
 
       if (!entrega) {
+        ciclo.cancelarRevision();
         return {
           content:
             'El planificador no entregó nada. Continúa con el plan actual y avisa al usuario.',
@@ -6378,50 +6791,57 @@ ipcMain.handle('chat:send', async (event, payload) => {
     getRestringir: () => state.prefs.restrictToWorkspace === true,
   };
 
-  const guardedTools = [planTool, askQuestionTool, askUserTool, enterPlanTool, invokeSubagentTool, defineSubagentTool, manageSubagentTool, makeSendMessageTool(), scheduleTool, notifyUserTool, runTestsTool, browserSubagent, ...baseTools].map((tool) =>
-    conHooks(conMonitorDeSeguridad(guardTool(tool, preset, prefs, () => mainWindow), {
-      modo: modoMonitor,
-      ...(clasificarConModelo ? { clasificar: clasificarConModelo } : {}),
-      alClasificar: (info) => {
-        if (info.fase === 'inicio') {
-          send({ type: 'guardian_check', herramienta: info.herramienta, callId: info.callId });
-        } else if (info.clasificacion) {
-          send({
-            type: 'guardian_result',
-            herramienta: info.herramienta,
-            callId: info.callId,
-            severidad: info.clasificacion.severity,
-            motivo: info.clasificacion.reason,
-            nivel: info.clasificacion.nivel,
-            cacheado: info.clasificacion.cacheado,
-          });
-        } else {
-          send({ type: 'guardian_result', herramienta: info.herramienta, callId: info.callId, fallo: true });
-        }
-      },
-      confirmar: async (info) => {
-        const ventana = mainWindow;
-        if (!ventana) return false;
-
-        const detalle =
-          `Severidad ${info.severidad}/10\n\n` +
-          `Señales detectadas:\n${info.senales.map((s) => `· ${s}`).join('\n') || '· (ninguna)'}\n\n` +
-          `Argumentos:\n${JSON.stringify(info.args, null, 2).slice(0, 600)}`;
-
-        const respuesta = await dialog.showMessageBox(ventana, {
-          type: 'warning',
-          buttons: ['Cancelar', 'Permitir igualmente'],
-          defaultId: 0,
-          cancelId: 0,
-          title: 'Monitor de seguridad',
-          message: `El monitor de seguridad ha marcado «${info.herramienta}»`,
-          detail: detalle,
+  const opcionesMonitor = {
+    modo: modoMonitor,
+    ...(clasificarConModelo ? { clasificar: clasificarConModelo } : {}),
+    alClasificar: (info) => {
+      if (info.fase === 'inicio') {
+        send({ type: 'guardian_check', herramienta: info.herramienta, callId: info.callId });
+      } else if (info.clasificacion) {
+        send({
+          type: 'guardian_result',
+          herramienta: info.herramienta,
+          callId: info.callId,
+          severidad: info.clasificacion.severity,
+          motivo: info.clasificacion.reason,
+          nivel: info.clasificacion.nivel,
+          cacheado: info.clasificacion.cacheado,
         });
+      } else {
+        send({ type: 'guardian_result', herramienta: info.herramienta, callId: info.callId, fallo: true });
+      }
+    },
+    confirmar: async (info) => {
+      const ventana = mainWindow;
+      if (!ventana) return false;
 
-        return respuesta.response === 1;
-      },
-    }), hookOptions),
-  );
+      const detalle =
+        `Severidad ${info.severidad}/10\n\n` +
+        `Señales detectadas:\n${info.senales.map((s) => `· ${s}`).join('\n') || '· (ninguna)'}\n\n` +
+        `Argumentos:\n${JSON.stringify(info.args, null, 2).slice(0, 600)}`;
+
+      const respuesta = await dialog.showMessageBox(ventana, {
+        type: 'warning',
+        buttons: ['Cancelar', 'Permitir igualmente'],
+        defaultId: 0,
+        cancelId: 0,
+        title: 'Monitor de seguridad',
+        message: `El monitor de seguridad ha marcado «${info.herramienta}»`,
+        detail: detalle,
+      });
+
+      return respuesta.response === 1;
+    },
+  };
+
+  /** Envuelve una tool con permisos, monitor de seguridad y hooks. */
+  const envolverTool = (tool) =>
+    conHooks(
+      conMonitorDeSeguridad(guardTool(tool, preset, prefs, () => mainWindow), opcionesMonitor),
+      hookOptions,
+    );
+
+  const guardedTools = [planTool, askQuestionTool, askUserTool, enterPlanTool, invokeSubagentTool, defineSubagentTool, manageSubagentTool, makeSendMessageTool(), scheduleTool, notifyUserTool, runTestsTool, browserSubagent, ...baseTools].map(envolverTool);
 
   const tools = new ToolRegistry().registerAll(guardedTools);
 
@@ -6450,11 +6870,9 @@ ipcMain.handle('chat:send', async (event, payload) => {
       name = `${tool.name}_${sufijo}`;
       sufijo += 1;
     }
-    const conNombre = { ...tool, name };
+    const conNombre = { ...tool, name, mcp: true };
     mcpToolDefs.push(conNombre);
-    tools.register(
-      conHooks(guardTool(conNombre, preset, prefs, () => mainWindow), hookOptions),
-    );
+    tools.register(envolverTool(conNombre));
   }
   // Recursos y prompts de MCP: herramientas genéricas que reciben el servidor.
   if (mcpClients.size > 0) {
@@ -6470,7 +6888,7 @@ ipcMain.handle('chat:send', async (event, payload) => {
     const nombres = () => [...mcpClients.keys()].join(', ');
 
     tools.register(
-      guardTool(
+      conMonitorDeSeguridad(guardTool(
         {
           name: 'list_resources',
           description:
@@ -6513,11 +6931,11 @@ ipcMain.handle('chat:send', async (event, payload) => {
         preset,
         prefs,
         () => mainWindow,
-      ),
+      ), opcionesMonitor),
     );
 
     tools.register(
-      guardTool(
+      conMonitorDeSeguridad(guardTool(
         {
           name: 'read_resource',
           description:
@@ -6556,11 +6974,11 @@ ipcMain.handle('chat:send', async (event, payload) => {
         preset,
         prefs,
         () => mainWindow,
-      ),
+      ), opcionesMonitor),
     );
 
     tools.register(
-      guardTool(
+      conMonitorDeSeguridad(guardTool(
         {
           name: 'list_prompts',
           description: 'Lista las plantillas de prompt que exponen los servidores MCP.',
@@ -6604,11 +7022,11 @@ ipcMain.handle('chat:send', async (event, payload) => {
         preset,
         prefs,
         () => mainWindow,
-      ),
+      ), opcionesMonitor),
     );
 
     tools.register(
-      guardTool(
+      conMonitorDeSeguridad(guardTool(
         {
           name: 'use_prompt',
           description: 'Obtiene una plantilla de prompt de un servidor MCP, ya rellenada con sus argumentos.',
@@ -6647,13 +7065,10 @@ ipcMain.handle('chat:send', async (event, payload) => {
         preset,
         prefs,
         () => mainWindow,
-      ),
+      ), opcionesMonitor),
     );
   }
 
-
-  const controller = new AbortController();
-  currentAbort = controller;
 
   // Memoria entre conversaciones: solo se inyecta al empezar un hilo, no en cada
   // turno, para no reenviar los mismos recuerdos una y otra vez.
@@ -6708,9 +7123,6 @@ ipcMain.handle('chat:send', async (event, payload) => {
     }
   }
   if (!turnCheckpoints.has(initialCount)) turnCheckpoints.set(initialCount, new Map());
-
-  state.busy = true;
-  send({ type: 'busy', busy: true });
 
   // El nivel elegido se traduce al campo que entiende este proveedor, solo
   // cuando el usuario ha encendido el pensamiento.
@@ -6772,8 +7184,9 @@ ipcMain.handle('chat:send', async (event, payload) => {
           if (avisoDelPlan) partes.push(avisoDelPlan);
           // Resúmenes de subagentes que terminaron entre pasos, aunque el
           // turno que los lanzó ya haya cerrado.
-          if (colaResultadosSubagentes.length > 0) {
-            partes.push(...colaResultadosSubagentes.splice(0));
+          const resultadosSubagentes = extraerResultadosSubagentes(state.sessionId);
+          if (resultadosSubagentes.length > 0) {
+            partes.push(...resultadosSubagentes);
           }
           return partes.length > 0 ? partes.join('\n\n') : null;
         },
@@ -6866,7 +7279,12 @@ ipcMain.handle('chat:send', async (event, payload) => {
         },
       },
       entradaFormateada,
-      { cwd: state.cwd, signal: controller.signal },
+      {
+        cwd: state.cwd,
+        signal: controller.signal,
+        sessionId: state.sessionId,
+        turno: currentTurnKey,
+      },
     );
 
     state.messages = result.messages;
@@ -6876,7 +7294,7 @@ ipcMain.handle('chat:send', async (event, payload) => {
       try {
         const sessions = await getStore();
         // En disco, sin secretos evidentes: el historial se relee al reabrir.
-        await sessions.append(state.sessionId, mensajesParaDisco(result.appended));
+        await enColaTienda(() => sessions.append(state.sessionId, mensajesParaDisco(result.appended)));
       } catch {
         // guardar es best-effort: no rompe la conversación
       }
@@ -6911,7 +7329,7 @@ ipcMain.handle('chat:send', async (event, payload) => {
           if (!titulo) return;
           if (!puedeRenombrarAutomatico(titulosManuales, sessionId)) return;
           const sessions = await getStore();
-          await sessions.rename(sessionId, titulo);
+          await enColaTienda(() => sessions.rename(sessionId, titulo));
           send({ type: 'session_title', sessionId, title: titulo });
         })
         .catch((error) => {
@@ -6935,20 +7353,49 @@ ipcMain.handle('chat:send', async (event, payload) => {
     return { ok: true, sessionId: state.sessionId };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    if (abortSolicitado && controller.signal.aborted) {
+      send({ type: 'aborted', sessionId: state.sessionId });
+      return { ok: true, aborted: true };
+    }
     send({ type: 'error', message });
     return { ok: false, error: message };
   } finally {
     currentAbort = null;
+    abortSolicitado = false;
     currentTurnKey = null;
     state.busy = false;
     send({ type: 'busy', busy: false });
+    void cerrarTareasAgenteDelTurno();
 
     // Si un subagente terminó justo cuando el turno cerraba, su resumen no
     // puede quedarse en el array: se entrega como despertar.
-    if (colaResultadosSubagentes.length > 0 && mainWindow && !mainWindow.isDestroyed()) {
+    const resultadosSubagentes = extraerResultadosSubagentes(state.sessionId);
+    if (resultadosSubagentes.length > 0 && mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('task:wake', {
-        texto: colaResultadosSubagentes.splice(0).join('\n\n'),
+        texto: resultadosSubagentes.join('\n\n'),
+        sessionId: state.sessionId,
       });
+    }
+  }
+  } catch (error) {
+    // El try interno cubre el bucle; esto cubre fallos de preparación
+    // (proveedor desconocido, sesión, plugins). Sin esto el invoke se rechaza
+    // y la UI se queda sin burbuja de error.
+    const message = error instanceof Error ? error.message : String(error);
+    if (!event.sender.isDestroyed()) {
+      event.sender.send('chat:event', { type: 'error', message });
+    }
+    return { ok: false, error: message };
+  } finally {
+    // Solo se libera aquí si el turno no llegó a la compuerta de ejecución
+    // (mensaje vacío, workspace ausente, proveedor sin modelos...).
+    if (state.busy) {
+      state.busy = false;
+      currentAbort = null;
+      abortSolicitado = false;
+      if (!event.sender.isDestroyed()) {
+        event.sender.send('chat:event', { type: 'busy', busy: false });
+      }
     }
   }
 });
@@ -6959,6 +7406,24 @@ ipcMain.handle('chat:send', async (event, payload) => {
 
 app.whenReady().then(async () => {
   await loadSettings();
+
+  // La poda usa la preferencia ya cargada; antes corría con prefs vacías y
+  // siempre aplicaba 30 días.
+  const diasTrayectoria = Number(state.prefs.trajectoryRetentionDays ?? 30);
+  if (Number.isFinite(diasTrayectoria) && diasTrayectoria > 0) {
+    trayectoria.podarAntiguas(diasTrayectoria).catch(() => {});
+  }
+
+  // TOFU SSH: la primera huella se guarda; las siguientes deben coincidir.
+  sshRemoto.workspace.setOnHostKey((host, port, fingerprint) => {
+    const clave = `${host}:${port}`;
+    if (state.prefs.sshTrusted?.[clave] === fingerprint) return;
+    state.prefs = {
+      ...state.prefs,
+      sshTrusted: { ...(state.prefs.sshTrusted ?? {}), [clave]: fingerprint },
+    };
+    saveSettings().catch(() => {});
+  });
 
   // Fixture de los verificadores: proyecto desechable sin tocar Ajustes.
   const testProjectIndex = process.argv.indexOf('--opengravity-test-new-project');
@@ -7118,6 +7583,13 @@ async function limpiezaAlSalir() {
     }
   }
   lspClients.clear();
+
+  // El proxy del navegador del agente no debe quedar vivo.
+  try {
+    require('./tools-extra.cjs').detenerProxyNavegador();
+  } catch {
+    // módulo no cargado
+  }
 
   // Los servidores MCP persistentes mueren con la app.
   await cerrarPlugins().catch(() => {});

@@ -83,3 +83,21 @@ test('edit_file acepta alias Target y Replacement y tolera CRLF/LF', async () =>
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('edit_file no interpreta $& del texto nuevo como grupo de reemplazo', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'og-edit-'));
+  try {
+    const ruta = join(dir, 'a.txt');
+    await writeFile(ruta, 'valor', 'utf8');
+    const tool = makeEditFileTool(() => dir);
+    const resultado = await tool.execute({
+      path: 'a.txt',
+      oldText: 'valor',
+      newText: 'literal $& y $$ y $1',
+    });
+    assert.equal(resultado.isError, undefined);
+    assert.equal(await readFile(ruta, 'utf8'), 'literal $& y $$ y $1');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

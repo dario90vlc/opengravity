@@ -9,7 +9,7 @@
  */
 
 const path = require('node:path');
-const { dentroDelWorkspace } = require('./hooks.cjs');
+const { dentroDelWorkspace, rutaReal } = require('./hooks.cjs');
 
 /** Raíces autorizadas, ya resueltas. */
 const raices = new Set();
@@ -22,8 +22,9 @@ function registrarRaiz(absoluta) {
 /** Resuelve una ruta del renderer y falla si queda fuera de las raíces. */
 function rutaAutorizada(cwd, pedida) {
   const absoluta = path.resolve(String(cwd ?? ''), String(pedida ?? ''));
+  const real = rutaReal(absoluta);
   for (const raiz of raices) {
-    if (dentroDelWorkspace(raiz, absoluta)) return absoluta;
+    if (dentroDelWorkspace(rutaReal(raiz), real)) return absoluta;
   }
   throw new Error(`ruta fuera del workspace: ${pedida}`);
 }

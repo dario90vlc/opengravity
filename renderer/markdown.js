@@ -57,7 +57,7 @@
 
     // Enlaces: solo http(s) y rutas relativas.
     out = out.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_match, label, href) => {
-      const safe = /^(https?:\/\/|\/|#)/.test(href) ? href : '#';
+      const safe = /^(https?:\/\/|file:\/\/|\/|#)/i.test(href) ? href : '#';
       return `<a href="${safe}" class="md-link">${label}</a>`;
     });
 
@@ -119,7 +119,7 @@
    * Convierte Markdown a HTML.
    * El texto de entrada se escapa antes de nada.
    */
-  function render(markdown) {
+  function render(markdown, opciones = {}) {
     const raw = String(markdown ?? '');
     // Normaliza encabezados pegados a texto previo sin salto de línea (ej: "texto.## Encabezado")
     const normalizado = raw.replace(/([^\n])\s*(#{1,4}\s+)/g, '$1\n\n$2');
@@ -151,8 +151,12 @@
         // El documento ya viene escapado; se revierte para que el resaltador
         // vea las comillas y operadores reales.
         const source = unescapeHtml(body.join('\n'));
+        // Durante streaming no se resalta: el tokenizador es costoso y el
+        // bloque aún puede cambiar. Se hace cuando el mensaje termina.
         const highlighted =
-          window.Highlight && language ? window.Highlight.render(source, language) : escapeHtml(source);
+          !opciones.streaming && window.Highlight && language
+            ? window.Highlight.render(source, language)
+            : escapeHtml(source);
         html.push(
           `<div class="md-pre"><div class="md-pre__lang">${language || 'texto'}</div>` +
             `<pre><code${cls}>${highlighted}</code></pre></div>`,

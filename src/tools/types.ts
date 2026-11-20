@@ -20,6 +20,9 @@ export interface ToolContext {
   log?: (message: string) => void;
   /** Id de la llamada del modelo, para que la UI case el aviso con su fila. */
   callId?: string;
+  /** Conversación y turno que originaron la herramienta (subagentes incluidos). */
+  sessionId?: string | null;
+  turno?: number | null;
 }
 
 /** Resultado de una herramienta. */

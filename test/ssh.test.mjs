@@ -21,3 +21,17 @@ test('SSH: exige host y usuario', () => {
   assert.throws(() => configuracion({ ssh: { host: '', user: 'root' } }), /host y usuario/);
   assert.throws(() => configuracion({ ssh: { host: 'h', user: '' } }), /host y usuario/);
 });
+
+test('SSH: la huella aprendida TOFU se usa si no hay una manual', () => {
+  const aprendida = configuracion({
+    ssh: { host: 'h', user: 'u', port: 22, hostFingerprint: '' },
+    sshTrusted: { 'h:22': 'SHA256:aprendida' },
+  });
+  assert.equal(aprendida.hostFingerprint, 'SHA256:aprendida');
+
+  const manual = configuracion({
+    ssh: { host: 'h', user: 'u', port: 22, hostFingerprint: 'SHA256:manual' },
+    sshTrusted: { 'h:22': 'SHA256:aprendida' },
+  });
+  assert.equal(manual.hostFingerprint, 'SHA256:manual');
+});

@@ -23,7 +23,11 @@ function configuracion(prefs) {
     keyPath: String(ssh.keyPath ?? '').trim(),
     remotePath: String(ssh.remotePath ?? '').trim() || '/',
     password: String(ssh.password ?? ''),
-    hostFingerprint: String(ssh.hostFingerprint ?? '').trim(),
+    // Huella manual o la primera vista aceptada (TOFU persistido). Una cadena
+    // vacía en `ssh.hostFingerprint` no debe ocultar la huella aprendida.
+    hostFingerprint:
+      String(ssh.hostFingerprint ?? '').trim() ||
+      String(prefs?.sshTrusted?.[`${host}:${Number(ssh.port ?? 22) || 22}`] ?? '').trim(),
   };
 }
 
@@ -33,6 +37,12 @@ class SshWorkspace {
     this.sftp = null;
     this.conectando = null;
     this.firma = '';
+    this.onHostKey = null;
+  }
+
+  /** Registra una huella nueva para persistirla (TOFU). */
+  setOnHostKey(fn) {
+    this.onHostKey = typeof fn === 'function' ? fn : null;
   }
 
   async conectar(config) {
@@ -74,7 +84,14 @@ class SshWorkspace {
           if (!cfg.hostFingerprint) return true;
           const crypto = require('node:crypto');
           const hash = crypto.createHash('sha256').update(key).digest('base64').replace(/=+$/, '');
-          return hash === cfg.hostFingerprint.replace(/^SHA256:/, '').replace(/=+$/, '');
+          const esperada = cfg.hostFingerprint.replace(/^SHA256:/, '').replace(/=+$/, '');
+          if (!esperada) {
+            // Primera conexión: se confía y se guarda la huella. Las siguientes
+            // se comparan contra ella; un MITM posterior no pasa.
+            this.onHostKey?.(cfg.host, cfg.port, hash);
+            return true;
+          }
+          return hash === esperada;
         },
       };
       if (cfg.keyPath) opciones.privateKey = require('node:fs').readFileSync(cfg.keyPath);
@@ -180,7 +197,19 @@ class SshWorkspace {
       await fsp.mkdir(local, { recursive: true });
       for (const entrada of lista) {
         if (omitir.has(entrada.name)) continue;
-        const destino = path.join(local, entrada.name);
+        // Un servidor SFTP hostil puede devolver `../` como nombre.
+        if (
+          typeof entrada.name !== 'string' ||
+          entrada.name === '.' ||
+          entrada.name === '..' ||
+          /[\\/]/.test(entrada.name)
+        ) {
+          throw new Error(`nombre remoto no válido: ${String(entrada.name).slice(0, 80)}`);
+        }
+        const destino = path.resolve(local, entrada.name);
+        if (destino !== local && !destino.startsWith(local + path.sep)) {
+          throw new Error(`ruta remota fuera del espejo: ${entrada.name}`);
+        }
         if (entrada.directory) {
           await bajar(entrada.path, destino);
           continue;

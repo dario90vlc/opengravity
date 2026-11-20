@@ -88,6 +88,9 @@ const ETIQUETA_DE_ESFUERZO = {
 };
 const ui = {
   busy: false,
+  busyConversation: null,
+  loadingConversation: false,
+  planEjecutando: false,
   // Despertares de tareas que llegaron con el turno ocupado.
   despertaresPendientes: [],
   activeConversation: null,
@@ -314,7 +317,18 @@ async function refreshConversations() {
   }
 
   renderConversations();
+  marcarConversacionOcupada();
   renderPaneTitle();
+}
+
+/** Marca la conversación que está ejecutando el agente. */
+function marcarConversacionOcupada() {
+  for (const fila of document.querySelectorAll('.conversation[data-session-id]')) {
+    fila.classList.toggle(
+      'is-busy',
+      Boolean(ui.busy && fila.dataset.sessionId === (ui.busyConversation ?? ui.activeConversation)),
+    );
+  }
 }
 
 function renderConversations() {
@@ -362,6 +376,7 @@ function renderConversations() {
     const row = document.createElement('div');
     row.className = anidada ? 'conversation conversation--project-child' : 'conversation';
     if (session.id === ui.activeConversation) row.classList.add('is-active');
+    row.dataset.sessionId = session.id;
     row.title = session.title;
 
     const title = document.createElement('span');
@@ -415,6 +430,10 @@ function renderConversations() {
 }
 
 async function deleteConversation(id) {
+  if (ui.busy) {
+    addNotice('No se puede borrar una conversación mientras el agente trabaja.', 'info');
+    return;
+  }
   try {
     await window.api.deleteSession(id);
     if (ui.activeConversation === id) newConversation();
@@ -523,6 +542,7 @@ function reflejarSinProyecto() {
 
 /** Activa un proyecto reciente sin abrir el diálogo del sistema. */
 async function seleccionarProyecto(cwd) {
+  if (ui.busy) { addNotice('Espera a que el agente termine o pulsa Detener antes de cambiar de proyecto.', 'info'); return; }
   if (!cwd) return;
   cerrarProjectMenu();
   const resultado = await window.api.selectProject(cwd);
@@ -534,10 +554,13 @@ async function seleccionarProyecto(cwd) {
   reflejarProyecto(resultado.project ?? resultado.cwd);
   await cargarProyectos();
   await refreshConversations();
+  await loadFileIndex();
+  await refreshGit();
 }
 
 /** Activa un proyecto remoto ya descargado en el espejo local. */
 async function abrirProyectoRemoto(resultado) {
+  if (ui.busy) { addNotice('Espera a que el agente termine o pulsa Detener antes de cambiar de proyecto.', 'info'); return; }
   if (!resultado?.ok) {
     addNotice(resultado?.error ?? 'No se pudo abrir el proyecto remoto.', 'error');
     return;
@@ -553,6 +576,7 @@ async function abrirProyectoRemoto(resultado) {
 
 /** «No Project»: no cambia el workspace; solo desasocia la conversación actual. */
 async function seleccionarSinProyecto() {
+  if (ui.busy) { addNotice('Espera a que el agente termine o pulsa Detener antes de cambiar de proyecto.', 'info'); return; }
   cerrarProjectMenu();
   const resultado = await window.api.clearProject();
   if (!resultado || resultado.ok === false) {
@@ -860,11 +884,14 @@ async function runMenuAction(action) {
 }
 
 async function changeWorkspace() {
+  if (ui.busy) { addNotice('Espera a que el agente termine o pulsa Detener antes de cambiar de proyecto.', 'info'); return; }
   const result = await window.api.openWorkspace();
   if (!result) return;
   await cargarProyectos();
   reflejarProyecto(result.cwd);
   await refreshConversations();
+  await loadFileIndex();
+  await refreshGit();
 }
 
 // ---------------------------------------------------------------------------
@@ -888,9 +915,10 @@ function clearThread() {
   updateEmptyState();
 }
 
-function addUserMessage(text) {
+function addUserMessage(text, messageIndex) {
   const wrap = document.createElement('div');
   wrap.className = 'msg msg--user';
+  if (typeof messageIndex === 'number') wrap.dataset.messageIndex = String(messageIndex);
 
   // Estructura medida en su DOM: burbuja ancha con texto y barra flotante.
   const bubble = document.createElement('div');
@@ -924,6 +952,13 @@ function addUserMessage(text) {
   revertBtn.dataset.testid = 'revert-button';
   revertBtn.innerHTML = window.Icon('undo', 14);
   revertBtn.addEventListener('click', () => {
+    // El índice del DOM no sirve: el historial incluye mensajes `tool` que no
+    // se pintan como `.msg`. Se usa el índice real guardado por el motor.
+    const guardado = Number(wrap.dataset.messageIndex);
+    if (Number.isFinite(guardado) && wrap.dataset.messageIndex !== undefined) {
+      revertTo(guardado);
+      return;
+    }
     const messages = [...els.threadInner.querySelectorAll('.msg')];
     const index = messages.indexOf(wrap);
     if (index >= 0) revertTo(index);
@@ -1033,11 +1068,17 @@ function addDiffCard(payload, proposalId) {
     accept.className = 'btn btn--primary';
     accept.textContent = 'Aplicar';
 
+    card.dataset.proposalId = String(proposalId);
     const resolve = async (accepted) => {
       accept.disabled = true;
       reject.disabled = true;
+      const respuesta = await window.api.respondDiff(proposalId, accepted);
+      if (respuesta && respuesta.ok === false) {
+        actions.replaceChildren(rowText('La propuesta ya no está disponible'));
+        card.classList.add('is-cancelled');
+        return;
+      }
       actions.replaceChildren(rowText(accepted ? 'Aplicado' : 'Rechazado'));
-      await window.api.respondDiff(proposalId, accepted);
     };
 
     reject.addEventListener('click', () => resolve(false));
@@ -2181,12 +2222,16 @@ function insertarTarjetaCambios(card) {
 
 /** Añade la tarjeta del turno recién terminado con los cambios del checkpoint. */
 async function addTurnReviewCard() {
+  const conversacion = ui.activeConversation;
   let cambios;
   try {
     cambios = await window.api.turnChanges();
   } catch {
     return;
   }
+  // Si el usuario cambió de conversación mientras llegaba la respuesta, la
+  // tarjeta del turno anterior no puede aparecer en la nueva.
+  if (conversacion !== ui.activeConversation) return;
   if (!cambios || !cambios.files) return;
 
   const card = crearTarjetaCambios(cambios);
@@ -2966,9 +3011,24 @@ function addNotice(message, kind) {
 }
 
 /** Pinta el markdown acumulado en el mensaje en curso. */
-function renderStreamingMarkdown() {
+function renderStreamingMarkdown(final = false) {
   if (!ui.streamingEl) return;
-  ui.streamingEl.innerHTML = window.Markdown.render(ui.streamingText);
+  // Un frame como máximo: los deltas llegan más rápido de lo que conviene
+  // re-renderizar el Markdown completo.
+  if (!final && ui.renderFrame) return;
+  if (ui.renderFrame) {
+    cancelAnimationFrame(ui.renderFrame);
+    ui.renderFrame = null;
+  }
+  if (final) {
+    ui.streamingEl.innerHTML = window.Markdown.render(ui.streamingText);
+    return;
+  }
+  ui.renderFrame = requestAnimationFrame(() => {
+    ui.renderFrame = null;
+    if (!ui.streamingEl) return;
+    ui.streamingEl.innerHTML = window.Markdown.render(ui.streamingText, { streaming: true });
+  });
 }
 
 /** Crea (o reutiliza) el grupo del subagente de navegador. */
@@ -3380,14 +3440,26 @@ function marcarGuardian(fila, texto, clase) {
 
 /** Añade una nota del sistema al hilo (por ejemplo, el monitor de ritmo). */
 function addSystemNote(texto) {
-  if (!ui.streamingEl) return;
+  // Fuera de la burbuja que se re-renderiza: si va dentro, el siguiente trozo
+  // de Markdown la borra con innerHTML.
   const nota = document.createElement('div');
   nota.className = 'system-note';
   nota.textContent = texto.replace(/^\[monitor de ritmo\]\s*/, '');
-  ui.streamingEl.append(nota);
+  els.threadInner.append(nota);
+  scrollToBottom();
 }
 
 function handleChatEvent(event) {
+  // Los eventos de un subagente de otra conversación ya no pertenecen al hilo
+  // visible; se descartan en vez de mezclarse con la sesión actual. Con una
+  // conversación nueva (activeConversation null) solo se aceptan si hay turno.
+  if (event.subagent && event.sessionId) {
+    if (ui.activeConversation) {
+      if (event.sessionId !== ui.activeConversation) return;
+    } else if (!ui.busy) {
+      return;
+    }
+  }
   switch (event.type) {
     case 'text': {
       if (event.planner) {
@@ -3470,14 +3542,15 @@ function handleChatEvent(event) {
     case 'tests_result': {
       // Resultado de la suite: aviso en la barra y, si hay fallos, el detalle.
       const resumen = event.resumen ?? {};
-      const texto = event.bien
-        ? `Tests: ${resumen.pasan ?? '?'} pasan`
-        : `Tests: ${resumen.pasan ?? '?'} pasan, ${resumen.fallan ?? '?'} fallan`;
+      const texto = event.bien === null
+        ? `Tests: ${resumen.pasan ?? '?'} pasan (resultado desconocido)`
+        : event.bien
+          ? `Tests: ${resumen.pasan ?? '?'} pasan`
+          : `Tests: ${resumen.pasan ?? '?'} pasan, ${resumen.fallan ?? '?'} fallan`;
 
       showAnnouncement(texto);
 
       if (Array.isArray(resumen.fallos) && resumen.fallos.length > 0) {
-        if (!ui.streamingEl) addAssistantMessage();
         const bloque = document.createElement('div');
         bloque.className = 'tests-failures';
 
@@ -3493,7 +3566,7 @@ function handleChatEvent(event) {
           bloque.append(linea);
         }
 
-        ui.streamingEl.append(bloque);
+        (ui.streamingEl ?? els.threadInner).append(bloque);
         scrollToBottom();
       }
       break;
@@ -3502,7 +3575,6 @@ function handleChatEvent(event) {
     case 'system_note': {
       // Nota del monitor de ritmo: se muestra en el hilo como aviso discreto.
       finishReasoningBlock();
-      if (!ui.streamingEl) addAssistantMessage();
       addSystemNote(event.text);
       scrollToBottom();
       break;
@@ -3608,6 +3680,41 @@ function handleChatEvent(event) {
       break;
     }
 
+    case 'aborted': {
+      // Las tarjetas interactivas ya se resolvieron en el proceso principal:
+      // quitarlas evita que un clic posterior parezca aplicarlas.
+      ui.planCard?.rechazar('Turno detenido.');
+      ui.planCard = null;
+      ui.planEjecutando = false;
+      for (const card of els.threadInner.querySelectorAll('.diff-card[data-proposal-id]')) {
+        card.querySelector('.diff-card__actions')?.replaceChildren(rowText('Turno cancelado'));
+        delete card.dataset.proposalId;
+      }
+      const hostPregunta = document.getElementById('ask-host');
+      if (hostPregunta) {
+        hostPregunta.replaceChildren();
+        hostPregunta.hidden = true;
+        delete hostPregunta.dataset.preguntaPendiente;
+      }
+      if (event.sessionId) {
+        ui.activeConversation = event.sessionId;
+        renderPaneTitle();
+        void refreshConversations();
+      }
+      hideLoading();
+      finishToolGroup();
+      ui.streamingEl = null;
+      ui.streamingText = '';
+      ui.huboHerramientasEnTurno = false;
+      addNotice('Turno detenido.', 'info');
+      break;
+    }
+
+    case 'plan_handoff': {
+      ui.planEjecutando = event.fase === 'ejecutando';
+      break;
+    }
+
     case 'error': {
       const bubble = ui.streamingEl ?? addAssistantMessage();
       bubble.classList.add('is-error');
@@ -3629,16 +3736,27 @@ function handleChatEvent(event) {
     case 'final':
       if (event.sessionId) {
         ui.activeConversation = event.sessionId;
+        if (ui.busy) ui.busyConversation = event.sessionId;
+        marcarConversacionOcupada();
         renderPaneTitle();
       }
       hideLoading();
+      ui.planEjecutando = false;
       ui.lastAssistantText = ui.streamingText;
+      renderStreamingMarkdown(true);
       ui.streamingEl = null;
       ui.streamingText = '';
       ui.huboHerramientasEnTurno = false;
       finishToolGroup();
       playChime();
       showFinalNotice(event);
+      // La burbuja de usuario de este turno conoce su índice real en el
+      // historial, no la posición entre los `.msg` visibles.
+      const usuarios = els.threadInner.querySelectorAll('.msg--user');
+      const ultimoUsuario = usuarios[usuarios.length - 1];
+      if (ultimoUsuario && typeof event.keepCount === 'number') {
+        ultimoUsuario.dataset.messageIndex = String(event.keepCount);
+      }
       addMessageToolbar(event.keepCount, ui.lastAssistantText ?? '');
       void addTurnReviewCard();
       refreshConversations();
@@ -3663,11 +3781,14 @@ function entregarDespertares() {
 
   const texto = ui.despertaresPendientes.shift();
   addNotice('Una tarea de fondo terminó. El agente continúa.', 'ok');
-  window.api.send({ text: texto }).catch(() => {});
+  window.api.sendPrompt({ text: texto }).catch(() => {});
 }
 
 function setBusy(busy) {
   ui.busy = busy;
+  ui.busyConversation = busy ? (ui.activeConversation ?? null) : null;
+  if (!busy) ui.planEjecutando = false;
+  marcarConversacionOcupada();
   els.input.placeholder = busy
     ? 'El agente está trabajando…'
     : 'Ask anything, @ to mention, / for actions';
@@ -3820,27 +3941,35 @@ function leerArchivo(file) {
   });
 }
 
-async function agregarArchivos(files) {
-  for (const file of [...files]) {
-    if (file.size > MAX_ADJUNTO) {
-      addNotice(`${file.name || 'Archivo'}: máximo 10 MB.`, 'error');
-      continue;
+let lecturasPendientes = Promise.resolve();
+
+function agregarArchivos(files) {
+  // Si el usuario pulsa Enter mientras FileReader lee, el envío debe esperar:
+  // antes el adjunto llegaba tarde y viajaba con el mensaje siguiente.
+  const tarea = lecturasPendientes.then(async () => {
+    for (const file of [...files]) {
+      if (file.size > MAX_ADJUNTO) {
+        addNotice(`${file.name || 'Archivo'}: máximo 10 MB.`, 'error');
+        continue;
+      }
+      try {
+        const dataUrl = await leerArchivo(file);
+        ui.attachments.push({
+          id: `adj-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+          name: file.name || 'archivo',
+          mime: file.type || 'application/octet-stream',
+          size: file.size,
+          dataUrl,
+        });
+      } catch (error) {
+        addNotice(`No se pudo adjuntar ${file.name || 'archivo'}: ${error?.message ?? error}`, 'error');
+      }
     }
-    try {
-      const dataUrl = await leerArchivo(file);
-      ui.attachments.push({
-        id: `adj-${Date.now()}-${Math.random().toString(36).slice(2)}`,
-        name: file.name || 'archivo',
-        mime: file.type || 'application/octet-stream',
-        size: file.size,
-        dataUrl,
-      });
-    } catch (error) {
-      addNotice(`No se pudo adjuntar ${file.name || 'archivo'}: ${error?.message ?? error}`, 'error');
-    }
-  }
-  renderAttachments();
-  updateSendState();
+    renderAttachments();
+    updateSendState();
+  });
+  lecturasPendientes = tarea.catch(() => {});
+  return tarea;
 }
 
 function manejarPegado(event) {
@@ -3863,10 +3992,11 @@ function manejarDrop(event) {
 
 /** ¿Se puede empezar un turno ahora? Con un plan pendiente, sí: es la revisión. */
 function puedeEnviar() {
-  return !ui.busy || Boolean(ui.planCard);
+  return !ui.loadingConversation && (!ui.busy || Boolean(ui.planCard));
 }
 
 async function send() {
+  await lecturasPendientes;
   const text = els.input.value.trim();
   const adjuntos = ui.attachments.slice();
   if ((text.length === 0 && adjuntos.length === 0) || !puedeEnviar()) return;
@@ -3886,6 +4016,10 @@ async function send() {
  */
 async function sendText(texto, adjuntos = []) {
   const text = String(texto ?? '').trim();
+  if (ui.loadingConversation) {
+    addNotice('Espera a que termine de abrir la conversación.', 'info');
+    return false;
+  }
   if ((text.length === 0 && adjuntos.length === 0) || !puedeEnviar()) return false;
 
   if (els.threadEmpty) els.threadEmpty.remove();
@@ -3898,25 +4032,36 @@ async function sendText(texto, adjuntos = []) {
   addUserMessage(text || etiquetaAdjuntos);
   if (ui.planCard) ui.planCard.rechazar(text);
 
-  const result = await window.api.sendPrompt({
-    text,
-    mentions,
-    attachments: adjuntos.map((adjunto) => ({
-      name: adjunto.name,
-      mime: adjunto.mime,
-      dataUrl: adjunto.dataUrl,
-      size: adjunto.size,
-    })),
-    effort: ui.effort,
-    preset: ui.prefs.permissionPreset ?? 'Turbo',
-    // Solo cuenta si el modelo actual lo admite; el proceso principal lo valida otra vez.
-    thinking: ui.thinking === true && modeloAdmitePensamiento(),
-  });
-  if (!result.ok && result.error) {
+  let result;
+  try {
+    result = await window.api.sendPrompt({
+      text,
+      mentions,
+      attachments: adjuntos.map((adjunto) => ({
+        name: adjunto.name,
+        mime: adjunto.mime,
+        dataUrl: adjunto.dataUrl,
+        size: adjunto.size,
+      })),
+      effort: ui.effort,
+      preset: ui.prefs.permissionPreset ?? 'Turbo',
+      // Solo cuenta si el modelo actual lo admite; el proceso principal lo valida otra vez.
+      thinking: ui.thinking === true && modeloAdmitePensamiento(),
+    });
+  } catch (error) {
+    const bubble = addAssistantMessage();
+    bubble.classList.add('is-error');
+    bubble.textContent = `Error: ${error?.message ?? error}`;
+    return false;
+  }
+  if (!result?.ok && result?.error) {
     const bubble = addAssistantMessage();
     bubble.classList.add('is-error');
     bubble.textContent = `Error: ${result.error}`;
   }
+  // El texto con un plan pendiente no inicia un turno: no hay que borrar el
+  // streaming parcial que ya estaba en pantalla.
+  if (result?.planFeedback) return true;
   ui.streamingEl = null;
   ui.streamingText = '';
   ui.huboHerramientasEnTurno = false;
@@ -3940,7 +4085,24 @@ async function enviarEncolado(text) {
 // Conversaciones guardadas
 // ---------------------------------------------------------------------------
 
+/** Texto visible de un mensaje de usuario; oculta los envoltorios internos. */
+function textoVisibleDeUsuario(content) {
+  let texto = String(content ?? '');
+  const peticion = /<USER_REQUEST>\s*([\s\S]*?)\s*<\/USER_REQUEST>/i.exec(texto);
+  if (peticion) texto = peticion[1];
+  texto = texto.replace(/<ADDITIONAL_METADATA>[\s\S]*?<\/ADDITIONAL_METADATA>/gi, '').trim();
+  return texto;
+}
+
 async function openConversation(id) {
+  if (ui.loadingConversation) {
+    addNotice('Espera a que termine de abrir la conversación.', 'info');
+    return;
+  }
+  if (ui.busy) {
+    addNotice('El agente está trabajando en esta conversación. Espera o pulsa Detener.', 'info');
+    return;
+  }
   // Si la vista de Automations está abierta, se cierra: ocupa el área del hilo.
   closeAutomations();
   /*
@@ -3948,9 +4110,14 @@ async function openConversation(id) {
    * carga, la respuesta lenta ya no repinta encima de la elegida.
    */
   const token = ++ui.loadToken;
+  ui.loadingConversation = true;
   try {
     const loaded = await window.api.loadSession(id);
     if (token !== ui.loadToken) return;
+    if (!loaded || loaded.ok === false) {
+      addNotice(loaded?.error ?? 'No se pudo abrir la conversación.', 'error');
+      return;
+    }
 
     ui.activeConversation = loaded.meta.id;
     ui.cwd = loaded.meta.cwd ?? ui.cwd;
@@ -4034,7 +4201,8 @@ async function openConversation(id) {
           continue;
         }
         vaciarCambios();
-        addUserMessage(message.content);
+        const visible = textoVisibleDeUsuario(message.content);
+        if (visible) addUserMessage(visible, indiceDeMensaje - 1);
       } else if (message.role === 'assistant') {
         for (const llamada of message.toolCalls ?? []) sumarCambio(llamada);
         if (message.content) {
@@ -4049,7 +4217,9 @@ async function openConversation(id) {
           // El pie también en el historial: hora, copiar y votos.
           const cuando = message.createdAt ?? loaded.meta.updatedAt ?? loaded.meta.createdAt;
           addMessageToolbar(
-            undefined,
+            // Índice real del mensaje: hace única la reacción y permite undo
+            // también en el historial reabierto.
+            indiceDeMensaje - 1,
             message.content,
             cuando ? relativeTime(cuando) : undefined,
           );
@@ -4083,18 +4253,34 @@ async function openConversation(id) {
     renderNavigator();
     scrollToBottom();
     refreshConversations();
+    // La conversación puede traer otro workspace: árbol y git deben seguirlo.
+    void loadFileIndex();
+    void refreshGit();
   } catch (error) {
     console.error(error);
+    addNotice('No se pudo abrir la conversación.', 'error');
+  } finally {
+    if (token === ui.loadToken) ui.loadingConversation = false;
   }
 }
 
 async function newConversation() {
   // Antes solo se limpiaba la UI: el motor seguía con `state.sessionId` y el
   // mensaje nuevo se añadía a la conversación anterior. Hay que resetearlo.
-  if (ui.busy) return;
+  if (ui.loadingConversation) {
+    addNotice('Espera a que termine de abrir la conversación.', 'info');
+    return false;
+  }
+  if (ui.busy) {
+    addNotice('El agente está trabajando. Espera o pulsa Detener antes de crear otra conversación.', 'info');
+    return false;
+  }
   try {
     const resultado = await window.api.newSession();
-    if (resultado && resultado.ok === false) return;
+    if (resultado && resultado.ok === false) {
+      addNotice(resultado.error ?? 'No se pudo crear la conversación.', 'error');
+      return false;
+    }
   } catch {
     // sin IPC se mantiene el flujo local
   }
@@ -4115,6 +4301,7 @@ async function newConversation() {
 
   els.input.focus();
   refreshConversations();
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -4690,11 +4877,16 @@ function playChime() {
 
 /** Carga el índice de ficheros del workspace (una vez por workspace). */
 async function loadFileIndex() {
+  const workspace = ui.cwd;
+  let indice;
   try {
-    ui.fileIndex = await window.api.indexFiles();
+    indice = await window.api.indexFiles();
   } catch {
-    ui.fileIndex = [];
+    indice = [];
   }
+  // Otra apertura de proyecto pudo terminar antes: su índice es el válido.
+  if (ui.cwd !== workspace) return;
+  ui.fileIndex = indice;
   renderFileTree();
 }
 
@@ -5148,11 +5340,27 @@ async function openInEditor(path, linea, columna) {
 
   try {
     const file = await window.api.readFile(path);
+
+    // Otra apertura del mismo fichero pudo terminar antes: reutilizarla en vez
+    // de crear dos pestañas y destruir el modelo que ya usa la primera.
+    const yaAbierta = ui.tabs.find((tab) => tab.path === file.path);
+    if (yaAbierta) {
+      activateTab(yaAbierta.path);
+      return;
+    }
+
     const language = monacoLanguage(file.path);
     const uri = monacoApi.Uri.parse(`inmemory://model/${file.path}`);
 
     const existente = monacoApi.editor.getModel(uri);
-    if (existente) existente.dispose();
+    if (existente) {
+      const enUso = ui.tabs.find((tab) => tab.model === existente);
+      if (enUso) {
+        activateTab(enUso.path);
+        return;
+      }
+      existente.dispose();
+    }
 
     const model = monacoApi.editor.createModel(file.content, language, uri);
 
@@ -5211,6 +5419,7 @@ async function formatearEditor() {
     return;
   }
 
+  const model = editor.getModel();
   const resultado = await window.api.lspFormat({ path: tab.path, content: editor.getValue() });
   if (!resultado?.ok) {
     addNotice(resultado?.error ?? 'No se pudo formatear.', 'error');
@@ -5220,6 +5429,8 @@ async function formatearEditor() {
     addNotice('El formato no cambió.', 'info');
     return;
   }
+  // El usuario pudo cambiar de pestaña mientras el LSP formateaba.
+  if (!model || editor.getModel() !== model || ui.activeTab !== tab.path) return;
   editor.setValue(resultado.content);
   updateEditorState();
   addNotice('Formateado con el LSP.', 'ok');
@@ -5233,6 +5444,11 @@ async function renombrarEditor() {
 
   if (['javascript', 'typescript', 'json', 'css', 'html'].includes(tab.lsp)) {
     await editor.getAction('editor.action.rename')?.run();
+    return;
+  }
+
+  if (ui.tabs.some((t) => t.model && t.original !== t.model.getValue())) {
+    addNotice('Guarda los ficheros modificados antes de renombrar con el LSP.', 'warning');
     return;
   }
 
@@ -5253,10 +5469,13 @@ async function renombrarEditor() {
   }
 
   const file = await window.api.readFile(tab.path);
+  if (!tab.model) return;
   tab.model.setValue(file.content);
   tab.original = file.content;
-  ui.editorOriginal = file.content;
-  updateEditorState();
+  if (ui.activeTab === tab.path) {
+    ui.editorOriginal = file.content;
+    updateEditorState();
+  }
   addNotice(`Renombrado en ${resultado.files} fichero(s).`, 'ok');
 }
 
@@ -5332,6 +5551,10 @@ async function mostrarQuickFixes() {
 
     boton.addEventListener('click', async () => {
       cerrarQuickFixes();
+      if (ui.tabs.some((t) => t.model && t.original !== t.model.getValue())) {
+        addNotice('Guarda los ficheros modificados antes de aplicar un quick fix.', 'warning');
+        return;
+      }
       try {
         const r = await window.api.lspApplyAction({ path: tab.path, indice, range: rango });
         if (r && r.ok) {
@@ -5640,6 +5863,11 @@ function closeTab(path) {
   const index = ui.tabs.findIndex((tab) => tab.path === path);
   if (index < 0) return;
 
+  const tab = ui.tabs[index];
+  if (tab?.model && tab.original !== tab.model.getValue()) {
+    if (!window.confirm(`«${tab.path}» tiene cambios sin guardar. ¿Cerrar igualmente?`)) return;
+  }
+
   const [cerrada] = ui.tabs.splice(index, 1);
   cerrada.model?.dispose();
 
@@ -5662,6 +5890,9 @@ function closeTab(path) {
 
 /** Cierra todas las pestañas y oculta el panel. */
 function closeEditor() {
+  if (ui.tabs.some((tab) => tab.model && tab.original !== tab.model.getValue())) {
+    if (!window.confirm('Hay pestañas con cambios sin guardar. ¿Cerrar el editor igualmente?')) return;
+  }
   for (const tab of ui.tabs) tab.model?.dispose();
   ui.tabs = [];
   ui.activeTab = null;
@@ -5785,8 +6016,12 @@ function scheduleLspChange() {
   if (['javascript', 'typescript', 'json', 'css', 'html'].includes(language)) return;
 
   if (ui.lspChangeTimer) clearTimeout(ui.lspChangeTimer);
+  // Capturar al programar: si el usuario cambia de pestaña en 500 ms, el
+  // cambio debe ir al fichero que lo originó, no al que esté activo después.
+  const ruta = ui.editorPath;
+  const contenido = monacoEditor.getValue();
   ui.lspChangeTimer = setTimeout(() => {
-    window.api.lspChange({ path: ui.editorPath, content: monacoEditor.getValue() }).catch(() => {});
+    window.api.lspChange({ path: ruta, content: contenido }).catch(() => {});
   }, 500);
 }
 
@@ -5794,22 +6029,30 @@ function scheduleLspChange() {
 async function saveEditor() {
   if (!ui.editorPath || !monacoEditor) return;
 
+  // Capturar antes del await: el usuario puede cambiar de pestaña o seguir
+  // escribiendo mientras el disco responde. Leer al volver marcaba como
+  // guardado texto que aún no se había escrito.
+  const ruta = ui.editorPath;
+  const contenido = monacoEditor.getValue();
+  const tab = ui.tabs.find((t) => t.path === ui.activeTab);
+
   try {
-    const tab = ui.tabs.find((t) => t.path === ui.activeTab);
     if (tab?.kind === 'remote') {
       const guardado = await window.api.sshWrite({
         path: tab.remotePath,
-        content: monacoEditor.getValue(),
+        content: contenido,
       });
       if (!guardado?.ok) throw new Error(guardado?.error ?? 'no se pudo guardar');
     } else {
-      await window.api.writeFile(ui.editorPath, monacoEditor.getValue());
+      await window.api.writeFile(ruta, contenido);
     }
 
     // El original vive en la pestaña: así el estado «sin guardar» es por fichero.
-    if (tab) tab.original = monacoEditor.getValue();
-    ui.editorOriginal = monacoEditor.getValue();
-    updateEditorState();
+    if (tab) tab.original = contenido;
+    if (ui.editorPath === ruta) {
+      ui.editorOriginal = contenido;
+      updateEditorState();
+    }
     renderEditorTabs();
   } catch (error) {
     addNotice(`No se pudo guardar: ${error.message ?? error}`, 'error');
@@ -6044,12 +6287,14 @@ async function refreshGit() {
   const filesEl = $('git-files');
   if (!branchEl || !filesEl) return;
 
+  const workspace = ui.cwd;
   let status;
   try {
     status = await window.api.gitStatus();
   } catch {
     status = { ok: false, error: 'git no disponible' };
   }
+  if (ui.cwd !== workspace) return;
 
   if (!status.ok) {
     branchEl.replaceChildren();
@@ -6066,6 +6311,7 @@ async function refreshGit() {
   } catch {
     branches = [];
   }
+  if (ui.cwd !== workspace) return;
 
   branchEl.replaceChildren();
   for (const branch of branches) {
@@ -7030,6 +7276,8 @@ async function ensurePty(id) {
     const entrada = terminales.get(id);
     const arrancado = await window.api.terminalStartPty({ id, kind: entrada?.kind ?? 'local' });
     if (!arrancado || !arrancado.ok) return null;
+    if (entrada) entrada.pty = true;
+    ptyActive = true;
 
     // Antigravity nombra la pestaña con la shell, no con un índice.
     const shell = arrancado.shell ? String(arrancado.shell).split(/[\\/]/).pop() : null;
@@ -7266,8 +7514,9 @@ async function toggleTerminal(force) {
 function terminalWrite(text, raw, id) {
   const entrada = id ? terminales.get(id) : terminalActiva ? terminales.get(terminalActiva) : null;
 
-  if (raw && entrada) {
-    // xterm interpreta ANSI, secuencias de control y redibujado.
+  if (entrada) {
+    // xterm interpreta ANSI; el texto no-raw del PTY (por ejemplo `[exit N]`)
+    // también debe ir aquí, porque la salida legacy está oculta.
     entrada.xterm.write(text);
     return;
   }
@@ -7284,9 +7533,10 @@ function terminalWrite(text, raw, id) {
 async function terminalSubmit() {
   const command = els.terminalInput.value;
 
-  if (ptyActive) {
+  const activa = terminalActiva ? terminales.get(terminalActiva) : null;
+  if (activa?.pty) {
     els.terminalInput.value = '';
-    await window.api.terminalPtyWrite(`${command}\r`);
+    await window.api.terminalPtyWrite({ id: terminalActiva, data: `${command}\r` });
     return;
   }
 
@@ -7534,8 +7784,24 @@ async function submitOrQueue() {
   if (ui.planCard) return send();
   if (!ui.busy) return send();
 
+  if (ui.planEjecutando) {
+    const texto = els.input.value.trim();
+    if (texto.length === 0) return;
+    els.input.value = '';
+    autoGrow();
+    updateSendState();
+    addUserMessage(texto);
+    const resultado = await window.api.sendPrompt({ text: texto });
+    if (!resultado?.ok) addNotice(resultado?.error ?? 'No se pudo enviar al planificador.', 'error');
+    return;
+  }
+
   if (ui.prefs.queuedMessages === 'Send Immediately') {
     await window.api.abortChat();
+    // Espera a que el proceso principal cierre el turno antes de enviar.
+    for (let i = 0; i < 100 && ui.busy; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
     ui.queue = [];
     return send();
   }
@@ -7952,7 +8218,15 @@ async function boot() {
    * entrega al terminar. Descartarlo perdía el resultado de la tarea para
    * siempre, que es peor que llegar tarde.
    */
-  window.api.onTaskWake?.(({ texto }) => {
+  window.api.onTaskWake?.(({ texto, sessionId }) => {
+    // Un despertar de otra conversación no se pinta en la actual.
+    if (sessionId) {
+      if (ui.activeConversation) {
+        if (sessionId !== ui.activeConversation) return;
+      } else if (!ui.busy) {
+        return;
+      }
+    }
     ui.despertaresPendientes.push(texto);
     if (ui.busy) {
       addNotice('Una tarea de fondo terminó. El agente la retomará al acabar.', 'ok');
@@ -7967,7 +8241,11 @@ async function boot() {
   // Una tarea vencida lanza su prompt en una conversación nueva.
   window.api.onScheduledFire(async (payload) => {
     closeScheduled();
-    await newConversation();
+    const creada = await newConversation();
+    if (!creada) {
+      addNotice('La tarea programada no pudo abrir una conversación nueva.', 'warning');
+      return;
+    }
     els.input.value = payload.prompt ?? '';
     autoGrow();
     updateSendState();
@@ -8147,14 +8425,14 @@ async function boot() {
 
     if (event.ctrlKey && event.key.toLowerCase() === 'c') {
       event.preventDefault();
-      await window.api.terminalPtyWrite('\u0003');
+      await window.api.terminalPtyWrite({ id: terminalActiva, data: '\u0003' });
       return;
     }
 
     const sequence = sequences[event.key];
     if (sequence) {
       event.preventDefault();
-      await window.api.terminalPtyWrite(sequence);
+      await window.api.terminalPtyWrite({ id: terminalActiva, data: sequence });
     }
   });
 
@@ -8164,7 +8442,8 @@ async function boot() {
   if (terminalKill) {
     terminalKill.addEventListener('click', () => {
       // Interrumpir solo la terminal activa, no todas.
-      if (ptyActive && terminalActiva) window.api.terminalPtyKill({ id: terminalActiva });
+      const activa = terminalActiva ? terminales.get(terminalActiva) : null;
+      if (activa?.pty && terminalActiva) window.api.terminalPtyKill({ id: terminalActiva });
       else window.api.terminalKill();
     });
   }
@@ -8239,10 +8518,13 @@ async function boot() {
   window.api.onDiffApplied((payload) => addDiffCard(payload, null));
 
   window.api.onRemotePrompt((text) => {
-    els.input.value = text;
-    autoGrow();
-    updateSendState();
-    submitOrQueue();
+    // No pisar lo que el usuario esté escribiendo: el prompt remoto se envía
+    // por su propio cauce, o se encola si hay un turno activo.
+    if (ui.busy) {
+      ui.queue.push(String(text ?? ''));
+      return;
+    }
+    void sendText(String(text ?? ''));
   });
 
   // --- Enlaces: respeta «Open Links In» ------------------------------------
@@ -8255,6 +8537,15 @@ async function boot() {
 
     event.preventDefault();
     const url = anchor.href;
+
+    if (/^file:\/\//i.test(url) || /^file:\/\//i.test(href)) {
+      const linea = /#L(\d+)(?:-L?\d+)?$/i.exec(href)?.[1];
+      let ruta = decodeURIComponent(href.replace(/^file:\/\/\/?/i, '').replace(/#.*$/, ''));
+      // file:///C:/... llega como /C:/... en Windows.
+      if (/^\/[A-Za-z]:[\\/]/.test(ruta)) ruta = ruta.slice(1);
+      void openInEditor(ruta, linea ? Number(linea) : undefined);
+      return;
+    }
 
     if (ui.prefs.openLinksIn === 'Built-in Browser') {
       window.api.openBrowser(url);

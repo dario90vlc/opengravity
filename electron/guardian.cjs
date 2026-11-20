@@ -84,7 +84,7 @@ const REGLAS = [
     senal: 'B',
     nombre: 'lectura de credenciales',
     severidad: 7,
-    re: /(\.ssh\/id_[a-z]+|\.aws\/credentials|\.npmrc|\.netrc|\/etc\/shadow|id_rsa|\.git-credentials|keychain|login\.keychain)/i,
+    re: /([\\/]\.ssh[\\/]id_[a-z0-9]+|[\\/]\.aws[\\/]credentials|\.npmrc|\.netrc|[\\/]etc[\\/]shadow|id_(rsa|ed25519|ecdsa|dsa)|\.git-credentials|keychain|login\.keychain|\.pem\b|\.p12\b)/i,
   },
 
   // --- H: datos saliendo de la organización --------------------------------
@@ -151,6 +151,11 @@ const CLAVES_INSPECCION = [
   'text',
   'script',
   'path',
+  'Path',
+  'filePath',
+  'file_path',
+  'dirPath',
+  'dir_path',
   'file',
   'targetFile',
   'absolutePath',

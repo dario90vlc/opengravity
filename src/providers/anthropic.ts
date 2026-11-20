@@ -140,9 +140,19 @@ export class AnthropicProvider implements ModelProvider {
      * nivel `max` (96k) convertía la petición en un 400.
      */
     const modelo = req.model.toLowerCase();
+    /*
+     * `thinking: {type:'enabled'}` no lo aceptan todos los Claude. 3.7–4.6 sí;
+     * 3.5 y anteriores no lo tienen y 4.7+ exige `adaptive` (400 con enabled).
+     */
+    const version = modelo.match(/claude-(?:[a-z]+-)?(\d+)(?:[.-](\d{1,2}))?(?=$|-)/);
+    const mayor = Number(version?.[1] ?? 0);
+    const menor = Number(version?.[2] ?? 0);
+    const admitePensamiento = (mayor === 3 && menor >= 7) || (mayor === 4 && menor <= 6);
     const topePensamiento =
       /claude-3-7|claude-[4-9]|claude-(?:opus|sonnet|haiku)-[4-9]/.test(modelo) ? 32_000 : 8_192;
-    const pensamiento = Math.min(Number(req.thinkingBudget ?? 0), topePensamiento - 1024);
+    const pensamiento = admitePensamiento
+      ? Math.min(Number(req.thinkingBudget ?? 0), topePensamiento - 1024)
+      : 0;
     if (pensamiento > 0) {
       body.thinking = { type: 'enabled', budget_tokens: pensamiento };
       body.max_tokens = Math.max(Number(body.max_tokens), pensamiento + 1024);
@@ -295,7 +305,7 @@ export class AnthropicProvider implements ModelProvider {
       yield { type: 'tool_call', call };
     }
 
-    if (toolBlocks.size > 0) finishReason = 'tool_calls';
+    if (toolBlocks.size > 0 && finishReason !== 'length') finishReason = 'tool_calls';
 
     if (inputTokens > 0 || outputTokens > 0) {
       yield { type: 'usage', inputTokens, outputTokens };

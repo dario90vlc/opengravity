@@ -1128,7 +1128,7 @@ async function main(): Promise<void> {
 
       if (sessionId !== undefined) {
         try {
-          await store.append(sessionId, result.appended);
+          await store.append(sessionId, result.appended.filter((message) => message.internal !== true));
           process.stderr.write(`Sesión guardada: ${sessionId}\n`);
         } catch (saveError) {
           process.stderr.write(

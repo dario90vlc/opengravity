@@ -15,6 +15,7 @@
  * El índice se guarda en disco y se refresca por fecha de modificación.
  */
 
+const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const path = require('node:path');
 
@@ -109,6 +110,7 @@ class CodeIndex {
     this.totalLength = 0;
     this.builtAt = null;
     this.building = false;
+    this.pendingRoot = null;
     this.embeddingCache = new Map(); // chunkId -> vector
   }
 
@@ -127,15 +129,22 @@ class CodeIndex {
 
   /** Recorre el proyecto y (re)indexa los ficheros que cambiaron. */
   async build(rootPath) {
-    if (this.building) return this.stats();
+    const root = path.resolve(rootPath ?? this.root);
+    if (this.building) {
+      // El caller cambió de proyecto mientras había un build en curso: se
+      // encola el último y se ejecuta al terminar, en vez de perderlo.
+      this.pendingRoot = root;
+      return this.stats();
+    }
     this.building = true;
 
     try {
-      if (rootPath) this.root = rootPath;
-
       const found = [];
-      await this.walk(this.root, 0, found);
+      await this.walk(root, 0, found, root);
 
+      // Un índice de otro proyecto no sirve para reutilizar entradas: las
+      // rutas relativas pueden coincidir y los contenidos no.
+      const previousFiles = this.root === root ? this.files : new Map();
       const nextFiles = new Map();
       let totalLength = 0;
       const docFreq = new Map();
@@ -153,7 +162,7 @@ class CodeIndex {
           continue;
         }
 
-        const anterior = this.files.get(relative);
+        const anterior = previousFiles.get(relative);
         if (anterior && anterior.mtime === info.mtimeMs && anterior.size === info.size) {
           nextFiles.set(relative, anterior);
           totalLength += anterior.length;
@@ -164,7 +173,7 @@ class CodeIndex {
           continue;
         }
 
-        const previous = this.files.get(relative);
+        const previous = previousFiles.get(relative);
         let entry;
 
         // Reutiliza si no cambió.
@@ -189,7 +198,6 @@ class CodeIndex {
             length: tokens.length,
             tf,
             symbols: extractSymbols(content),
-            content,
           };
         }
 
@@ -203,18 +211,25 @@ class CodeIndex {
       this.files = nextFiles;
       this.docFreq = docFreq;
       this.totalLength = totalLength;
+      this.root = root;
       this.builtAt = Date.now();
-      this.building = false;
       this.lastReused = reutilizados;
       this.references = null; // se reconstruyen bajo demanda
 
       return { ...this.stats(), reused: reutilizados };
     } finally {
       this.building = false;
+      const pendiente = this.pendingRoot;
+      this.pendingRoot = null;
+      if (pendiente) {
+        // No se await: el build llamador ya puede responder; el siguiente
+        // reemplaza el índice cuando termine.
+        void this.build(pendiente).catch(() => {});
+      }
     }
   }
 
-  async walk(directory, depth, out) {
+  async walk(directory, depth, out, root = this.root) {
     if (out.length >= MAX_FILES || depth > 8) return;
 
     let entries;
@@ -233,9 +248,9 @@ class CodeIndex {
       const absolute = path.join(directory, entry.name);
 
       if (entry.isDirectory()) {
-        await this.walk(absolute, depth + 1, out);
+        await this.walk(absolute, depth + 1, out, root);
       } else if (entry.isFile()) {
-        out.push(path.relative(this.root, absolute).split(path.sep).join('/'));
+        out.push(path.relative(root, absolute).split(path.sep).join('/'));
       }
     }
   }
@@ -256,8 +271,14 @@ class CodeIndex {
       return null;
     }
 
-    const contenido = this.files.get(file)?.content;
-    if (!contenido) return null;
+    let contenido = this.files.get(file)?.content;
+    if (!contenido) {
+      try {
+        contenido = fs.readFileSync(path.join(this.root, file), 'utf8');
+      } catch {
+        return null;
+      }
+    }
 
     const scriptKind = /\.tsx$/i.test(file)
       ? ts.ScriptKind.TSX
@@ -313,8 +334,14 @@ class CodeIndex {
     // Una sola pasada por fichero: se parsea una vez y se recogen todos los
     // identificadores, en lugar de reparsear por cada nombre.
     for (const [file, entry] of this.files) {
-      const contenido = entry.content;
-      if (!contenido) continue;
+      let contenido = entry.content;
+      if (!contenido) {
+        try {
+          contenido = fs.readFileSync(path.join(this.root, file), 'utf8');
+        } catch {
+          continue;
+        }
+      }
 
       const encontrados = this.collectIdentifiers(file, contenido, nombres);
 

@@ -5,6 +5,7 @@
 // Los suyos son arbitrarios (`pre_invocation_hook_names`). Aquí hay un conjunto
 // concreto y útil, más reglas declarativas configurables desde Ajustes.
 
+const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const path = require('node:path');
 
@@ -22,8 +23,27 @@ const CLAVES_DE_RUTA = {
   file_search: ['path'],
   search_code: ['path'],
   view_code_item: ['path'],
+  generate_image: ['path'],
   run_command: ['cwd'],
 };
+
+/** Resuelve symlinks/junctions del tramo existente de una ruta. */
+function rutaReal(ruta) {
+  let actual = path.resolve(ruta);
+  const resto = [];
+
+  while (true) {
+    try {
+      const real = fs.realpathSync.native(actual);
+      return resto.length > 0 ? path.join(real, ...resto.reverse()) : real;
+    } catch {
+      const padre = path.dirname(actual);
+      if (padre === actual) return path.resolve(ruta);
+      resto.push(path.basename(actual));
+      actual = padre;
+    }
+  }
+}
 
 /** ¿La ruta resuelta sigue dentro del workspace? */
 function dentroDelWorkspace(cwd, absoluta) {
@@ -33,9 +53,11 @@ function dentroDelWorkspace(cwd, absoluta) {
 
 /** ¿La ruta está dentro del cwd o de alguna raíz añadida con `--add-dir`? */
 function dentroDeRaices(cwd, raices, absoluta) {
-  if (dentroDelWorkspace(cwd, absoluta)) return true;
+  const real = rutaReal(absoluta);
+  if (dentroDelWorkspace(rutaReal(cwd), real)) return true;
   return (Array.isArray(raices) ? raices : []).some((raiz) =>
-    typeof raiz === 'string' && raiz.length > 0 && dentroDelWorkspace(raiz, absoluta),
+    typeof raiz === 'string' && raiz.length > 0 &&
+    dentroDelWorkspace(rutaReal(raiz), real),
   );
 }
 
@@ -73,6 +95,21 @@ function absolutizarRutas(toolName, args, getCwd, restringir = false, getRoots) 
 
   const nuevos = { ...args };
   const notas = [];
+
+  // Las herramientas aceptan alias (`Path`, `filePath`…) por compatibilidad.
+  // El sandbox y la tarjeta de diff solo miran la clave canónica, así que se
+  // normaliza aquí antes de cualquier comprobación.
+  const ALIAS = {
+    path: ['Path', 'filePath', 'file_path'],
+    target: ['Target'],
+    directory: ['dirPath', 'dir_path'],
+    cwd: ['Cwd'],
+  };
+  for (const clave of claves) {
+    if (nuevos[clave] !== undefined) continue;
+    const alias = (ALIAS[clave] ?? []).find((nombre) => typeof nuevos[nombre] === 'string');
+    if (alias) nuevos[clave] = nuevos[alias];
+  }
 
   for (const clave of claves) {
     const valor = nuevos[clave];
@@ -147,6 +184,14 @@ const PATRONES_SECRETO = [
   {
     nombre: 'asignación de secreto',
     re: /\b(api[_-]?key|secret|password|passwd|token)\s*[:=]\s*["'][^"'\s]{12,}["']/gi,
+  },
+  {
+    nombre: 'clave privada PEM',
+    re: /-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----/g,
+  },
+  {
+    nombre: 'clave secreta AWS',
+    re: /\b(?:aws_secret_access_key|AWS_SECRET_ACCESS_KEY)\s*[:=]\s*["']?[A-Za-z0-9/+=]{40}["']?/g,
   },
 ];
 
@@ -402,6 +447,7 @@ function redactarDatos(valor) {
 module.exports = {
   conHooks,
   absolutizarRutas,
+  rutaReal,
   dentroDelWorkspace,
   dentroDeRaices,
   sanearEntorno,

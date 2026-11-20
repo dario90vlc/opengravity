@@ -190,62 +190,46 @@ async function consultar(
   signal: AbortSignal | undefined,
   timeoutMs: number,
 ): Promise<{ severity: number; reason: string } | null> {
-  const controlador = new AbortController();
-  const temporizador = setTimeout(() => controlador.abort(), timeoutMs);
-  temporizador.unref?.();
+  const intento = async (messages: Array<{ role: 'user' | 'assistant'; content: string }>, maxTokens: number) => {
+    const controlador = new AbortController();
+    const temporizador = setTimeout(() => controlador.abort(), timeoutMs);
+    temporizador.unref?.();
+    const abortarExterno = () => controlador.abort();
+    signal?.addEventListener('abort', abortarExterno, { once: true });
+    if (signal?.aborted) controlador.abort();
 
-  const abortarExterno = () => controlador.abort();
-  signal?.addEventListener('abort', abortarExterno, { once: true });
-
-  let texto = '';
-  try {
-    for await (const chunk of provider.streamGenerate(
-      {
-        model,
-        messages: [{ role: 'user', content: prompt }],
-        // Los modelos con razonamiento se comen el presupuesto pensando antes de
-        // escribir el JSON; con un tope bajo la respuesta llega vacía o cortada.
-        maxTokens: 900,
-        temperature: 0,
-      },
-      controlador.signal,
-    )) {
-      if (chunk.type === 'text') texto += chunk.text;
-      if (chunk.type === 'done') break;
+    let texto = '';
+    try {
+      for await (const chunk of provider.streamGenerate(
+        { model, messages, maxTokens, temperature: 0 },
+        controlador.signal,
+      )) {
+        if (chunk.type === 'text') texto += chunk.text;
+        if (chunk.type === 'done') break;
+      }
+      return texto;
+    } catch {
+      return '';
+    } finally {
+      clearTimeout(temporizador);
+      signal?.removeEventListener('abort', abortarExterno);
     }
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(temporizador);
-    signal?.removeEventListener('abort', abortarExterno);
-  }
+  };
 
+  const texto = await intento([{ role: 'user', content: prompt }], 900);
   const veredicto = parsearVeredicto(texto);
   if (veredicto) return veredicto;
 
-  // Segundo intento, más tajante: a veces el modelo envuelve el JSON en prosa.
-  let texto2 = '';
-  try {
-    for await (const chunk of provider.streamGenerate(
-      {
-        model,
-        messages: [
-          { role: 'user', content: prompt },
-          { role: 'assistant', content: texto.slice(0, 500) || '(sin respuesta)' },
-          { role: 'user', content: 'Devuelve solo el JSON, sin explicación ni markdown.' },
-        ],
-        maxTokens: 300,
-        temperature: 0,
-      },
-      controlador.signal,
-    )) {
-      if (chunk.type === 'text') texto2 += chunk.text;
-      if (chunk.type === 'done') break;
-    }
-  } catch {
-    return null;
-  }
-
+  // Segundo intento con su PROPIO timeout: antes reutilizaba el controlador ya
+  // cerrado y podía colgarse o ignorar la cancelación del usuario.
+  const texto2 = await intento(
+    [
+      { role: 'user', content: prompt },
+      { role: 'assistant', content: texto.slice(0, 500) || '(sin respuesta)' },
+      { role: 'user', content: 'Devuelve solo el JSON, sin explicación ni markdown.' },
+    ],
+    300,
+  );
   return parsearVeredicto(texto2);
 }
 

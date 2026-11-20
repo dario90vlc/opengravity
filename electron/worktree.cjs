@@ -85,7 +85,7 @@ async function crear(cwd, nombre) {
     return { ok: false, motivo: `git worktree add falló: ${alta.error.trim().slice(0, 200)}` };
   }
 
-  return { ok: true, ruta, rama };
+  return { ok: true, ruta, rama, baseCwd: cwd };
 }
 
 /** ¿El subagente dejó cambios en su worktree? */
@@ -116,6 +116,25 @@ async function cerrar(cwd, { ruta, rama }) {
         `El subagente dejó cambios en su worktree aislado.\n` +
         `Ruta: ${ruta}\nRama: ${rama}\n` +
         `Revísalos antes de fusionar; no se ha tocado tu rama de trabajo.`,
+    };
+  }
+
+  /*
+   * Un worktree limpio puede tener commits que solo viven en su rama. Borrar la
+   * rama con `-D` los perdería sin aviso.
+   */
+  const cuenta = await git(cwd, ['rev-list', '--count', `HEAD..${rama}`]);
+  const commits = Number(cuenta.salida.trim());
+  if (cuenta.ok && Number.isFinite(commits) && commits > 0) {
+    return {
+      ok: true,
+      conservado: true,
+      ruta,
+      rama,
+      nota:
+        `El subagente dejó ${commits} commit(s) en su worktree aislado.\n` +
+        `Ruta: ${ruta}\nRama: ${rama}\n` +
+        'Revísalos antes de fusionar; no se ha tocado tu rama de trabajo.',
     };
   }
 
