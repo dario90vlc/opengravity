@@ -4485,6 +4485,63 @@ function closeSettings() {
 // Preferencias aplicadas
 // ---------------------------------------------------------------------------
 
+let activeMonacoThemeName = 'agent-dark';
+let activeXtermTheme = null;
+const systemColorScheme =
+  typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+    ? window.matchMedia('(prefers-color-scheme: dark)')
+    : null;
+
+function applyMonacoTheme(monacoTheme) {
+  const monaco = window.MonacoApp?.monaco;
+  if (!monaco || !monacoTheme) return;
+  monaco.editor.defineTheme('opengravity-dynamic', monacoTheme);
+  monaco.editor.setTheme('opengravity-dynamic');
+  activeMonacoThemeName = 'opengravity-dynamic';
+}
+
+function applyXtermTheme(xtermTheme) {
+  if (!xtermTheme) return;
+  activeXtermTheme = xtermTheme;
+  if (typeof terminales === 'undefined') return;
+  for (const entrada of terminales.values()) {
+    if (entrada?.xterm?.options) {
+      entrada.xterm.options.theme = xtermTheme;
+    }
+  }
+}
+
+function applyTheme(prefs) {
+  const prefersDark = systemColorScheme ? systemColorScheme.matches : true;
+  const root = document.documentElement.style;
+
+  if (window.ThemeEngine) {
+    const tokens = window.ThemeEngine.buildThemeTokens(prefs, prefersDark);
+    document.documentElement.dataset.theme = tokens.mode;
+    document.documentElement.dataset.contrast = tokens.contrast;
+    document.documentElement.dataset.preset = tokens.presetId.toLowerCase().replace(/\s+/g, '-');
+    for (const [variable, value] of Object.entries(tokens.cssVars)) {
+      root.setProperty(variable, value);
+    }
+    applyMonacoTheme(tokens.monacoTheme);
+    applyXtermTheme(tokens.xtermTheme);
+    return;
+  }
+
+  document.documentElement.dataset.contrast =
+    prefs?.themeContrast === 'Strong' ? 'strong' : 'default';
+  document.documentElement.dataset.theme = prefs?.theme === 'Light' ? 'light' : 'dark';
+}
+
+if (systemColorScheme && typeof systemColorScheme.addEventListener === 'function') {
+  systemColorScheme.addEventListener('change', () => {
+    if (ui.prefs?.theme === 'System') {
+      applyTheme(ui.prefs);
+      requestAnimationFrame(() => { void window.api.refreshTitlebar?.(); });
+    }
+  });
+}
+
 /** Aplica las preferencias que cambian la interfaz. */
 function applyPrefs(prefs) {
   if (!prefs) return;
@@ -4495,37 +4552,8 @@ function applyPrefs(prefs) {
     ui.effort = ui.prefs.effort;
     if (els.effortLabel) els.effortLabel.textContent = ui.effort;
   }
-  document.documentElement.dataset.contrast =
-    ui.prefs.themeContrast === 'Strong' ? 'strong' : 'default';
 
-  // Tema oscuro o claro (afecta a todos los tokens).
-  document.documentElement.dataset.theme =
-    ui.prefs.theme === 'Light' ? 'light' : 'dark';
-  document.documentElement.dataset.preset =
-    ui.prefs.theme !== 'Light' && ui.prefs.darkPreset === 'Nord' ? 'nord' : 'default';
-
-  // Colores personalizados del tema oscuro.
-  const colors = ui.prefs.themeColors ?? {};
-  const root = document.documentElement.style;
-  const mapping = {
-    background: '--background',
-    foreground: '--foreground',
-    accent: '--primary',
-  };
-
-  for (const [key, variable] of Object.entries(mapping)) {
-    const value = colors[key];
-    if (typeof value === 'string' && value.trim().length > 0) {
-      root.setProperty(variable, value.trim());
-    } else {
-      root.removeProperty(variable);
-    }
-  }
-
-  if (monacoApi?.editor?.setTheme) monacoApi.editor.setTheme(temaMonaco());
-  for (const terminal of terminales?.values?.() ?? []) {
-    terminal.xterm.options.theme = temaXterm();
-  }
+  applyTheme(ui.prefs);
 
   // La barra nativa se pinta después de aplicar los tokens, también al
   // arrancar con un tema guardado.
@@ -5070,55 +5098,6 @@ function registrarLenguajeR(monaco) {
   });
 }
 
-/** Tema Monaco de Nord; se registra una sola vez al cargar el editor. */
-function registrarTemaNord(monaco) {
-  if (!monaco?.editor?.defineTheme || monaco.editor.getTheme?.() === 'agent-nord') return;
-  monaco.editor.defineTheme('agent-nord', {
-    base: 'vs-dark',
-    inherit: true,
-    rules: [
-      { token: 'comment', foreground: '616e88', fontStyle: 'italic' },
-      { token: 'string', foreground: 'a3be8c' },
-      { token: 'number', foreground: 'b48ead' },
-      { token: 'keyword', foreground: '81a1c1' },
-      { token: 'type.identifier', foreground: '8fbcbb' },
-      { token: 'identifier', foreground: 'd8dee9' },
-      { token: 'delimiter', foreground: 'eceff4' },
-      { token: 'tag', foreground: '81a1c1' },
-      { token: 'attribute.name', foreground: '8fbcbb' },
-      { token: 'attribute.value', foreground: 'a3be8c' },
-    ],
-    colors: {
-      'editor.background': '#2e3440',
-      'editor.foreground': '#d8dee9',
-      'editorLineNumber.foreground': '#616e88',
-      'editorLineNumber.activeForeground': '#d8dee9',
-      'editor.selectionBackground': '#88c0d066',
-      'editor.lineHighlightBackground': '#3b4252',
-      'editorCursor.foreground': '#d8dee9',
-      'editorWidget.background': '#3b4252',
-      'editorWidget.border': '#4c566a',
-      'editorSuggestWidget.background': '#3b4252',
-      'editorSuggestWidget.border': '#4c566a',
-      'editorSuggestWidget.selectedBackground': '#434c5e',
-      'editorHoverWidget.background': '#3b4252',
-      'editorHoverWidget.border': '#4c566a',
-      'editorError.foreground': '#bf616a',
-      'editorWarning.foreground': '#ebcb8b',
-      'scrollbarSlider.background': '#4c566a80',
-      'scrollbarSlider.hoverBackground': '#616e8899',
-    },
-  });
-}
-
-function temaMonaco() {
-  return ui.prefs?.theme !== 'Light' && ui.prefs?.darkPreset === 'Nord' ? 'agent-nord' : 'agent-dark';
-}
-
-function temaXterm() {
-  return ui.prefs?.theme !== 'Light' && ui.prefs?.darkPreset === 'Nord' ? TEMA_XTERM_NORD : TEMA_XTERM;
-}
-
 /** Crea el editor de un grupo (0 = izquierda, 1 = derecha). */
 function ensureMonaco(group = 0) {
   if (ui.editors[group]) return ui.editors[group];
@@ -5129,13 +5108,13 @@ function ensureMonaco(group = 0) {
     return null;
   }
   registrarLenguajeR(monacoApi);
-  registrarTemaNord(monacoApi);
+  applyTheme(ui.prefs);
 
   const contenedor = document.getElementById(group === 0 ? 'editor-monaco' : 'editor-monaco-2');
   if (!contenedor) return null;
 
   const instancia = monacoApi.editor.create(contenedor, {
-    theme: temaMonaco(),
+    theme: activeMonacoThemeName,
     automaticLayout: true,
     fontSize: 12,
     lineHeight: 19,
@@ -6776,30 +6755,6 @@ const TEMA_XTERM = {
   brightWhite: '#ffffff',
 };
 
-/** Tema de xterm para Nord. */
-const TEMA_XTERM_NORD = {
-  background: '#2e3440',
-  foreground: '#d8dee9',
-  cursor: '#d8dee9',
-  selectionBackground: '#88c0d066',
-  black: '#3b4252',
-  red: '#bf616a',
-  green: '#a3be8c',
-  yellow: '#ebcb8b',
-  blue: '#81a1c1',
-  magenta: '#b48ead',
-  cyan: '#88c0d0',
-  white: '#e5e9f0',
-  brightBlack: '#4c566a',
-  brightRed: '#d08770',
-  brightGreen: '#b9d4a8',
-  brightYellow: '#f0d9a0',
-  brightBlue: '#8fbcbb',
-  brightMagenta: '#cba6c9',
-  brightCyan: '#9fd8e6',
-  brightWhite: '#eceff4',
-};
-
 /** Crea una terminal nueva con su propio xterm y su pestaña. */
 function crearTerminal(idSugerido, opciones = {}) {
   if (!window.XtermApp) return null;
@@ -6824,7 +6779,7 @@ function crearTerminal(idSugerido, opciones = {}) {
     cursorBlink: true,
     convertEol: true,
     scrollback: 5000,
-    theme: temaXterm(),
+    theme: activeXtermTheme ?? TEMA_XTERM,
   });
 
   const fit = new FitAddon();
